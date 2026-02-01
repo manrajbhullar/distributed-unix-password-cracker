@@ -53,9 +53,9 @@ def parse_arguments(ctx: Context) -> State:
     ctx.username = args.username
     ctx.port = args.port
     
+    print(type(args))
     return State.HANDLE_ARGS
     
-
 
 def handle_arguments(ctx: Context) -> State:
     print(ctx.filename)
@@ -65,7 +65,7 @@ def handle_arguments(ctx: Context) -> State:
     return State.EXIT
 
 
-def exit_program(ctx):
+def exit_program(ctx: Context) -> State:
     print("Exiting program")
     sys.exit(0)
 
@@ -74,12 +74,11 @@ def error(ctx: Context) -> State:
     pass
 
 
-
-def parse_shadow():
+def parse_shadow(ctx: Context) -> State:
     pass
 
 
-def listen():
+def listen(ctx: Context) -> State:
     pass
 
 
@@ -93,9 +92,8 @@ def main():
         State.EXIT: exit_program
     }
 
-    while state != State.EXIT:
+    while True:
         state = handlers[state](ctx)
-    handlers[State.EXIT](ctx)
     
 
 if __name__ == "__main__":
