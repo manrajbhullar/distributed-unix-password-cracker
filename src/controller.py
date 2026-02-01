@@ -1,5 +1,5 @@
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 import sys
 
@@ -7,16 +7,24 @@ import sys
 class State(Enum):
     PARSE_ARGS = auto()
     HANDLE_ARGS = auto()
+    PARSE_SHADOW = auto()
     EXIT = auto()
     ERROR = auto()
 
 
 @dataclass
-class Context:
+class Settings:
     filename: str | None = None
     username: str | None = None
     port: int | None = None
 
+
+@dataclass
+class Context:
+    args: argparse.Namespace | None = None      
+    settings: Settings = field(default_factory=Settings)
+    exit_message: str | None = None
+    
 
 def parse_arguments(ctx: Context) -> State:
     parser = argparse.ArgumentParser(
@@ -47,23 +55,32 @@ def parse_arguments(ctx: Context) -> State:
         required=True
     )
 
-    args = parser.parse_args()
-
-    ctx.filename = args.filename
-    ctx.username = args.username
-    ctx.port = args.port
+    ctx.args = parser.parse_args()
     
-    print(type(args))
     return State.HANDLE_ARGS
     
 
 def handle_arguments(ctx: Context) -> State:
-    print(ctx.filename)
-    print(ctx.username)
-    print(ctx.port)
+    args = ctx.args
+    if not (1024 <= args.port <= 65535):
+        ctx.exit_message = "Port must be between 1024 and 65535"
+        return State.ERROR
 
-    return State.EXIT
+    try:
+        with open(args.filename, "r"):
+            pass
+    except FileNotFoundError:
+        ctx.exit_message = "Shadow file not found"
+        return State.ERROR
+    except PermissionError:
+        ctx.exit_message = "Shadow file not readable"
+        return State.ERROR
 
+    ctx.settings.filename = args.filename
+    ctx.settings.username = args.username
+    ctx.settings.port = args.port
+
+    return State.PARSE_SHADOW
 
 def exit_program(ctx: Context) -> State:
     print("Exiting program")
@@ -75,7 +92,9 @@ def error(ctx: Context) -> State:
 
 
 def parse_shadow(ctx: Context) -> State:
-    pass
+    print(ctx.settings)
+    
+    return State.EXIT
 
 
 def listen(ctx: Context) -> State:
@@ -89,6 +108,7 @@ def main():
     handlers = {
         State.PARSE_ARGS: parse_arguments,
         State.HANDLE_ARGS: handle_arguments,
+        State.PARSE_SHADOW: parse_shadow,
         State.EXIT: exit_program
     }
 
