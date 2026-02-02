@@ -4,12 +4,15 @@ from enum import Enum, auto
 import socket
 import sys
 
+from helpers import send_msg, recv_msg
+
 
 class State(Enum):
     PARSE_ARGS = auto()
     HANDLE_ARGS = auto()
     CONNECT = auto()
     REGISTER = auto()
+    WAIT_JOB = auto()
     CLEANUP = auto()
     ERROR = auto()
 
@@ -93,10 +96,33 @@ def register(ctx: Context) -> State:
             return State.ERROR
 
         print("Registered with controller")
-        return State.CLEANUP  # later -> WAIT_JOB
+        return State.WAIT_JOB
 
     except OSError as e:
         ctx.exit_message = f"Register failed: {e}"
+        return State.ERROR
+
+
+def receive_job(ctx: Context) -> State:
+    try:
+        job = recv_msg(ctx.sock)
+
+        if job.get("type") != "job":
+            ctx.exit_message = f"Unexpected message type: {job.get('type')}"
+            return State.ERROR
+
+        print("Job received")
+        print(" job_id:", job["job_id"])
+        print(" username:", job["username"])
+        print(" alg_id:", job["alg_id"])
+        print(" salt:", job.get("salt"))
+        print(" hash:", job.get("hash"))
+        print(" charset_len:", len(job["charset"]))
+
+        return State.CLEANUP  # TEMP
+
+    except OSError as e:
+        ctx.exit_message = f"Receive job failed: {e}"
         return State.ERROR
 
 
@@ -120,7 +146,9 @@ def main():
         State.HANDLE_ARGS: handle_arguments,
         State.CONNECT: connect,
         State.REGISTER: register,
-        State.CLEANUP: cleanup,
+        State.WAIT_JOB: receive_job,
+        State.ERROR: error,
+        State.CLEANUP: cleanup
     }
 
     while True:

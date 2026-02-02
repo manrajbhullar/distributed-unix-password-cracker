@@ -4,6 +4,8 @@ from enum import Enum, auto
 import sys
 import socket
 
+from helpers import send_msg, recv_msg
+
 
 class State(Enum):
     PARSE_ARGS = auto()
@@ -41,7 +43,11 @@ class Context:
     server_sock: socket.socket | None = None   # listening socket
     worker_sock: socket.socket | None = None   # accepted connection
     worker_addr: tuple[str, int] | None = None
-    
+    job_seq: int = 0
+
+def next_job_id(ctx: Context) -> str:
+    ctx.job_seq += 1
+    return f"{ctx.job_seq:06d}"    
 
 def parse_arguments(ctx: Context) -> State:
     parser = argparse.ArgumentParser(
@@ -220,8 +226,36 @@ def receive_registration(ctx: Context) -> State:
 
 
 def dispatch_job(ctx: Context) -> State:
-    print("DISPATCH_JOB reached (stub)")
-    return State.CLEANUP
+    SAFE79 = (
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "abcdefghijklmnopqrstuvwxyz"
+        "0123456789"
+        "@#%^&*()_+-=.,:;?"
+    )
+
+    if ctx.worker_sock is None:
+        ctx.exit_message = "No connected worker"
+        return State.ERROR
+
+    job = {
+        "type": "job",
+        "job_id": next_job_id(ctx),
+        "username": ctx.settings.username,
+        "alg_id": ctx.shadow.alg_id,
+        "salt": ctx.shadow.salt,
+        "hash": ctx.shadow.hash,
+        "hash_full": ctx.shadow.full,
+        "charset": SAFE79,
+    }
+
+    try:
+        send_msg(ctx.worker_sock, job)
+        print(f"Dispatched job {job['job_id']}")
+        return State.CLEANUP  # TEMP; later you’ll go WAIT_RESULT
+
+    except OSError as e:
+        ctx.exit_message = f"Dispatch failed: {e}"
+        return State.ERROR
 
 
 def main():
@@ -236,6 +270,7 @@ def main():
         State.WAIT_REGISTER: accept_worker,
         State.RECEIVE_REGISTRATION: receive_registration,
         State.DISPATCH_JOB: dispatch_job,
+        State.ERROR: error,
         State.CLEANUP: cleanup
     }
 
