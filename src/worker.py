@@ -9,6 +9,7 @@ class State(Enum):
     PARSE_ARGS = auto()
     HANDLE_ARGS = auto()
     CONNECT = auto()
+    REGISTER = auto()
     CLEANUP = auto()
     ERROR = auto()
 
@@ -70,10 +71,32 @@ def connect(ctx: Context) -> State:
         ctx.sock = s
 
         print(f"Connected to controller at {host}:{port}")
-        return State.CLEANUP  # TEMP for now (later -> REGISTER)
+        return State.REGISTER
 
     except OSError as e:
         ctx.exit_message = f"Connect failed: {e}"
+        return State.ERROR
+
+
+def register(ctx: Context) -> State:
+    try:
+        ctx.sock.sendall(b"REGISTER\n")
+
+        data = ctx.sock.recv(64)
+        if not data:
+            ctx.exit_message = "Controller closed connection during registration"
+            return State.ERROR
+
+        msg = data.decode("utf-8", errors="replace").strip()
+        if msg != "OK":
+            ctx.exit_message = f"Registration rejected: {msg}"
+            return State.ERROR
+
+        print("Registered with controller")
+        return State.CLEANUP  # later -> WAIT_JOB
+
+    except OSError as e:
+        ctx.exit_message = f"Register failed: {e}"
         return State.ERROR
 
 
@@ -96,6 +119,7 @@ def main():
         State.PARSE_ARGS: parse_arguments,
         State.HANDLE_ARGS: handle_arguments,
         State.CONNECT: connect,
+        State.REGISTER: register,
         State.CLEANUP: cleanup,
     }
 

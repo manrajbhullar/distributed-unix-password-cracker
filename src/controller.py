@@ -11,6 +11,8 @@ class State(Enum):
     PARSE_SHADOW = auto()
     LISTEN = auto()
     WAIT_REGISTER = auto()
+    RECEIVE_REGISTRATION = auto()
+    DISPATCH_JOB = auto()
     CLEANUP = auto()
     ERROR = auto()
 
@@ -180,20 +182,46 @@ def listen(ctx: Context) -> State:
     
 
 def accept_worker(ctx: Context) -> State:
-    if ctx.server_sock is None:
-        ctx.exit_message = "Internal error: server socket not initialized"
-        return State.ERROR
-
     try:
         conn, addr = ctx.server_sock.accept()
         ctx.worker_sock = conn
         ctx.worker_addr = addr
         print(f"Worker connected from {addr[0]}:{addr[1]}")
-        return State.CLEANUP
-
+        return State.RECEIVE_REGISTRATION
     except OSError as e:
         ctx.exit_message = f"Accept failed: {e}"
         return State.ERROR
+
+
+def receive_registration(ctx: Context) -> State:
+    if ctx.worker_sock is None:
+        ctx.exit_message = "No worker socket to register"
+        return State.ERROR
+
+    try:
+        data = ctx.worker_sock.recv(64)
+        if not data:
+            ctx.exit_message = "Worker disconnected before registering"
+            return State.ERROR
+
+        msg = data.decode("utf-8", errors="replace").strip()
+        if msg != "REGISTER":
+            ctx.worker_sock.sendall(b"ERR expected REGISTER\n")
+            ctx.exit_message = f"Bad registration message: {msg}"
+            return State.ERROR
+
+        ctx.worker_sock.sendall(b"OK\n")
+        print("Worker registered")
+        return State.DISPATCH_JOB
+
+    except OSError as e:
+        ctx.exit_message = f"Registration recv failed: {e}"
+        return State.ERROR
+
+
+def dispatch_job(ctx: Context) -> State:
+    print("DISPATCH_JOB reached (stub)")
+    return State.CLEANUP
 
 
 def main():
@@ -206,6 +234,8 @@ def main():
         State.PARSE_SHADOW: parse_shadow,
         State.LISTEN: listen,
         State.WAIT_REGISTER: accept_worker,
+        State.RECEIVE_REGISTRATION: receive_registration,
+        State.DISPATCH_JOB: dispatch_job,
         State.CLEANUP: cleanup
     }
 
