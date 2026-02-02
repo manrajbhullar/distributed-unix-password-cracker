@@ -2,13 +2,16 @@ import argparse
 from dataclasses import dataclass, field
 from enum import Enum, auto
 import sys
+import socket
 
 
 class State(Enum):
     PARSE_ARGS = auto()
     HANDLE_ARGS = auto()
     PARSE_SHADOW = auto()
-    EXIT = auto()
+    LISTEN = auto()
+    WAIT_REGISTER = auto()
+    CLEANUP = auto()
     ERROR = auto()
 
 
@@ -20,10 +23,22 @@ class Settings:
 
 
 @dataclass
+class ShadowInfo:
+    alg_id: str | None = None
+    salt: str | None = None
+    hash: str | None = None
+    full: str | None = None   
+
+
+@dataclass
 class Context:
     args: argparse.Namespace | None = None      
     settings: Settings = field(default_factory=Settings)
     exit_message: str | None = None
+    shadow: ShadowInfo = field(default_factory=ShadowInfo)
+    server_sock: socket.socket | None = None   # listening socket
+    worker_sock: socket.socket | None = None   # accepted connection
+    worker_addr: tuple[str, int] | None = None
     
 
 def parse_arguments(ctx: Context) -> State:
@@ -82,23 +97,103 @@ def handle_arguments(ctx: Context) -> State:
 
     return State.PARSE_SHADOW
 
-def exit_program(ctx: Context) -> State:
+def cleanup(ctx: Context) -> State:
+    if ctx.worker_sock:
+        ctx.worker_sock.close()
+    if ctx.server_sock:
+        ctx.server_sock.close()
+
     print("Exiting program")
     sys.exit(0)
 
 
 def error(ctx: Context) -> State:
-    pass
+    print(ctx.exit_message)
+    return State.CLEANUP
 
 
 def parse_shadow(ctx: Context) -> State:
-    print(ctx.settings)
-    
-    return State.EXIT
+    username = ctx.settings.username
+    filename = ctx.settings.filename
+
+    try:
+        with open(filename, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+
+                fields = line.split(":")
+                if len(fields) < 2:
+                    continue  # malformed line
+
+                user = fields[0]
+                pw_field = fields[1]
+
+                if user != username:
+                    continue
+
+                # Found the user
+                if pw_field in ("", "!", "*", "!!"):
+                    ctx.exit_message = f"User '{username}' has no usable hash (locked/empty)."
+                    return State.ERROR
+
+                # Store raw hash field
+                ctx.shadow.full = pw_field
+
+                # Hash formats: $id$salt$hash  (per your class pdf) :contentReference[oaicite:2]{index=2}
+                if pw_field.startswith("$"):
+                    toks = pw_field.split("$")
+                    # Example: ["", "6", "randomsalt", "hashedpassword"]
+                    if len(toks) >= 2:
+                        ctx.shadow.alg_id = toks[1]
+                    if len(toks) >= 3:
+                        ctx.shadow.salt = toks[2]
+                    if len(toks) >= 4:
+                        ctx.shadow.hash = toks[3]
+                else:
+                    # Some systems may store non-$ formats; keep full and fail later if needed
+                    ctx.shadow.alg_id = None
+
+                return State.LISTEN 
+    except:
+        ctx.exit_message = f"Username '{username}' not found in shadow file"
+        return State.ERROR
+
 
 
 def listen(ctx: Context) -> State:
-    pass
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("0.0.0.0", ctx.settings.port))
+        s.listen(1)
+
+        ctx.server_sock = s
+        print(f"Listening on port {ctx.settings.port}")
+
+        return State.WAIT_REGISTER
+
+    except OSError as e:
+        ctx.exit_message = f"Listen failed: {e}"
+        return State.ERROR
+    
+
+def accept_worker(ctx: Context) -> State:
+    if ctx.server_sock is None:
+        ctx.exit_message = "Internal error: server socket not initialized"
+        return State.ERROR
+
+    try:
+        conn, addr = ctx.server_sock.accept()
+        ctx.worker_sock = conn
+        ctx.worker_addr = addr
+        print(f"Worker connected from {addr[0]}:{addr[1]}")
+        return State.CLEANUP
+
+    except OSError as e:
+        ctx.exit_message = f"Accept failed: {e}"
+        return State.ERROR
 
 
 def main():
@@ -109,7 +204,9 @@ def main():
         State.PARSE_ARGS: parse_arguments,
         State.HANDLE_ARGS: handle_arguments,
         State.PARSE_SHADOW: parse_shadow,
-        State.EXIT: exit_program
+        State.LISTEN: listen,
+        State.WAIT_REGISTER: accept_worker,
+        State.CLEANUP: cleanup
     }
 
     while True:
