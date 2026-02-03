@@ -15,6 +15,7 @@ class State(Enum):
     WAIT_REGISTER = auto()
     RECEIVE_REGISTRATION = auto()
     DISPATCH_JOB = auto()
+    WAIT_RESULT = auto()
     CLEANUP = auto()
     ERROR = auto()
 
@@ -251,12 +252,43 @@ def dispatch_job(ctx: Context) -> State:
     try:
         send_msg(ctx.worker_sock, job)
         print(f"Dispatched job {job['job_id']}")
-        return State.CLEANUP  # TEMP; later you’ll go WAIT_RESULT
+        return State.WAIT_RESULT
 
     except OSError as e:
         ctx.exit_message = f"Dispatch failed: {e}"
         return State.ERROR
 
+def wait_result(ctx: Context) -> State:
+    print("Waiting for worker to finish cracking...")
+    try:
+        # This will block until the worker sends the result dictionary
+        result = recv_msg(ctx.worker_sock)
+        
+        print("\n" + "="*30)
+        print("      CRACKING RESULTS")
+        print("="*30)
+        
+        if result.get("found"):
+            print(f"STATUS:   SUCCESS")
+            print(f"PASSWORD: {result.get('password')}")
+        else:
+            print(f"STATUS:   FAILED")
+            print(f"REASON:   {result.get('status', 'Unknown')}")
+
+        print(f"ATTEMPTS: {result.get('attempts')}")
+        print(f"TIME:     {result.get('compute_time'):.4f} seconds")
+        
+        # Calculate Hashes Per Second (HPS) for your report
+        if result.get("compute_time", 0) > 0:
+            hps = result['attempts'] / result['compute_time']
+            print(f"SPEED:    {hps:.2f} hashes/sec")
+        print("="*30)
+
+        return State.CLEANUP
+
+    except OSError as e:
+        ctx.exit_message = f"Failed to receive result: {e}"
+        return State.ERROR
 
 def main():
     ctx = Context()
@@ -270,6 +302,7 @@ def main():
         State.WAIT_REGISTER: accept_worker,
         State.RECEIVE_REGISTRATION: receive_registration,
         State.DISPATCH_JOB: dispatch_job,
+        State.WAIT_RESULT: wait_result,
         State.ERROR: error,
         State.CLEANUP: cleanup
     }

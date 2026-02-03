@@ -3,6 +3,9 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 import socket
 import sys
+import itertools
+import time
+import crypt
 
 from helpers import send_msg, recv_msg
 
@@ -13,6 +16,8 @@ class State(Enum):
     CONNECT = auto()
     REGISTER = auto()
     WAIT_JOB = auto()
+    CRACK = auto()
+    SEND_RESULT = auto()
     CLEANUP = auto()
     ERROR = auto()
 
@@ -29,6 +34,7 @@ class Context:
     settings: Settings = field(default_factory=Settings)
     exit_message: str | None = None
     sock: socket.socket | None = None  # connection to controller
+    job_data: dict | None = None
 
 
 def parse_arguments(ctx: Context) -> State:
@@ -111,18 +117,88 @@ def receive_job(ctx: Context) -> State:
             ctx.exit_message = f"Unexpected message type: {job.get('type')}"
             return State.ERROR
 
-        print("Job received")
-        print(" job_id:", job["job_id"])
-        print(" username:", job["username"])
-        print(" alg_id:", job["alg_id"])
-        print(" salt:", job.get("salt"))
-        print(" hash:", job.get("hash"))
-        print(" charset_len:", len(job["charset"]))
-
-        return State.CLEANUP  # TEMP
+        ctx.job_data = job # Save the job for the CRACK state
+        print(f"Job {job['job_id']} received. Starting to crack...")
+        return State.CRACK
 
     except OSError as e:
         ctx.exit_message = f"Receive job failed: {e}"
+        return State.ERROR
+
+
+def crack(ctx: Context) -> State:
+    job = ctx.job_data
+    target_hash = job["hash_full"]
+    charset = job["charset"]
+    
+    # Pre-cache function lookups to avoid global lookups in the loop
+    do_crypt = crypt.crypt
+    do_join = "".join
+    
+    start_time = time.time()
+    found_password = None
+    attempts = 0
+    status_message = "Search Exhausted"
+
+    print(f"Cracking {job['username']}...")
+    
+    try:
+        for length in itertools.count(1): 
+            # product() is a generator; it's fast. 
+            # But the 'for' loop around it is the Python bottleneck.
+            for combo in itertools.product(charset, repeat=length):
+                attempts += 1
+                
+                # OPTIMIZATION: Call join directly inside the crypt call.
+                # This avoids creating a named variable 'candidate' in the local scope.
+                if do_crypt(do_join(combo), target_hash) == target_hash:
+                    found_password = do_join(combo)
+                    break
+            
+            if found_password:
+                break
+                
+    except KeyboardInterrupt:
+        status_message = "Manually Interrupted"
+    except Exception as e:
+        status_message = f"Runtime Error: {str(e)}"
+
+    end_time = time.time()
+    ctx.job_data["result"] = {
+        "found": found_password is not None,
+        "password": found_password or "N/A",
+        "compute_time": end_time - start_time,
+        "attempts": attempts,
+        "status": status_message if not found_password else "Success"
+    }
+    
+    return State.SEND_RESULT
+
+
+def send_result(ctx: Context) -> State:
+    if not ctx.job_data or "result" not in ctx.job_data:
+        ctx.exit_message = "No result data to send"
+        return State.ERROR
+
+    res = ctx.job_data["result"]
+    
+    # Construct the message to send back
+    result_msg = {
+        "type": "result",
+        "job_id": ctx.job_data["job_id"],
+        "found": res["found"],
+        "password": res["password"],
+        "attempts": res["attempts"],
+        "compute_time": res["compute_time"],
+        "status": res.get("status", "Completed")
+    }
+
+    try:
+        send_msg(ctx.sock, result_msg)
+        print("Result sent to controller successfully.")
+        return State.CLEANUP
+    except OSError as e:
+        ctx.exit_message = f"Socket error while sending result: {e}"
         return State.ERROR
 
 
@@ -147,6 +223,8 @@ def main():
         State.CONNECT: connect,
         State.REGISTER: register,
         State.WAIT_JOB: receive_job,
+        State.CRACK: crack,
+        State.SEND_RESULT: send_result,
         State.ERROR: error,
         State.CLEANUP: cleanup
     }
