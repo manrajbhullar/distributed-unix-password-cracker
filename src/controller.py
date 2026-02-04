@@ -70,7 +70,6 @@ def parse_arguments(ctx: Context) -> State:
         epilog=""
     )
     
-
     parser.add_argument(
         "-f", "--filename",
         type=str, 
@@ -166,8 +165,10 @@ def parse_shadow(ctx: Context) -> State:
                 ctx.parse_time = ctx.parse_end - ctx.parse_start
                 
                 return State.LISTEN
-    except:
         ctx.exit_message = f"ERROR: Username '{username}' not found in shadow file"
+        return State.ERROR
+    except:
+        ctx.exit_message = f"ERROR: Failed to parse shadow file. {e}"
         return State.ERROR
 
 
@@ -315,7 +316,7 @@ def wait_result(ctx: Context) -> State:
         print(f"{'STATUS:':<{label_width}} {status_value}")
         print(f"{'PASSWORD:':<{label_width}} {password_value}")
         print(f"{'ATTEMPTS:':<{label_width}} {attempts_value}")
-        print(f"{'TIME:':<{label_width}} {crack_time_value:.4f} seconds")
+        print(f"{'TIME:':<{label_width}} {crack_time_value:.2f} seconds")
         print(f"{'SPEED:':<{label_width}} {hps:.2f} hashes/sec")
 
         print(f"{'PARSING TIME:':<{label_width}} {(ctx.parse_time * 1000):.2f} milliseconds")
@@ -329,7 +330,6 @@ def wait_result(ctx: Context) -> State:
     except OSError as e:
         ctx.exit_message = f"ERROR: Failed to receive result. {e}"
         return State.ERROR
-
 
 
 def error(ctx: Context) -> State:
