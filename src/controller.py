@@ -4,6 +4,7 @@ from enum import Enum, auto
 import sys
 import socket
 import json
+import time
 
 from messaging import send_msg, recv_msg
 
@@ -54,10 +55,12 @@ class Context:
     worker_id: str | None = None    # Single worker registration id
     job_id: int = 1     # Single job needed right now
 
+    parse_start: float | None = None
+    parse_end: float | None = None
+    parse_time: float | None = None
+    dispatch_latency: float | None = None
+    result_return_latency: float | None = None
 
-def next_job_id(ctx: Context) -> str:
-    ctx.job_seq += 1
-    return f"{ctx.job_seq:06d}"    
 
 
 def parse_arguments(ctx: Context) -> State:
@@ -118,8 +121,9 @@ def handle_arguments(ctx: Context) -> State:
 def parse_shadow(ctx: Context) -> State:
     username = ctx.settings.username
     filename = ctx.settings.filename
-
+   
     try:
+        ctx.parse_start = time.time() 
         with open(filename, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -157,8 +161,11 @@ def parse_shadow(ctx: Context) -> State:
                 else:
                     ctx.exit_message = f"ERROR: User hash failed to tokenize"
                     return State.ERROR
-
-                return State.LISTEN 
+                
+                ctx.parse_end = time.time()
+                ctx.parse_time = ctx.parse_end - ctx.parse_start
+                
+                return State.LISTEN
     except:
         ctx.exit_message = f"ERROR: Username '{username}' not found in shadow file"
         return State.ERROR
@@ -237,6 +244,8 @@ def receive_registration(ctx: Context) -> State:
 
 
 def dispatch_job(ctx: Context) -> State:
+    dispatch_start_time = time.time()
+
     charset = (
         "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
         "abcdefghijklmnopqrstuvwxyz"
@@ -257,6 +266,7 @@ def dispatch_job(ctx: Context) -> State:
         "hash": ctx.pw_info.hash,
         "hash_full": ctx.pw_info.full,
         "charset": charset,
+        "dispatch_start_time": dispatch_start_time
     }
 
     try:
@@ -273,33 +283,53 @@ def wait_result(ctx: Context) -> State:
     print("  Waiting for worker to finish cracking...")
     try:
         result = recv_msg(ctx.worker_sock)
+
+        result_return_end = time.time()
+        result_return_start = result.get("send_result_start")
+        ctx.result_return_latency = result_return_end - result_return_start
+        ctx.dispatch_latency = result.get("dispatch_latency")
+
         print("  Worker has finished")
         
-        print("\n" + "="*30)
-        print("      CRACKING RESULTS")
-        print("="*30)
-        
-        if result.get("found"):
-            print(f"STATUS:   SUCCESS")
-            print(f"PASSWORD: {result.get('password')}")
-        else:
-            print(f"STATUS:   FAILED")
-            print(f"REASON:   {result.get('status', 'Unknown')}")
+        print("\n" + "="*40)
+        print("            CRACKING RESULTS")
+        print("="*40)
 
-        print(f"ATTEMPTS: {result.get('attempts')}")
-        print(f"TIME:     {result.get('compute_time'):.4f} seconds")
-        
-        # Calculate Hashes Per Second (HPS) for your report
-        if result.get("compute_time", 0) > 0:
-            hps = result['attempts'] / result['compute_time']
-            print(f"SPEED:    {hps:.2f} hashes/sec")
-        print("="*30)
+        if result.get("found"):
+            status_value = "SUCCESS"
+            password_value = result.get("password")
+        else:
+            status_value = "FAILED"
+            password_value = "N/A"
+
+        attempts_value = result.get("attempts")
+        crack_time_value = result.get("compute_time")
+
+        if crack_time_value and crack_time_value > 0:
+            hps = attempts_value / crack_time_value
+        else:
+            hps = 0
+
+        label_width = 20   # Controls alignment of values
+
+        print(f"{'STATUS:':<{label_width}} {status_value}")
+        print(f"{'PASSWORD:':<{label_width}} {password_value}")
+        print(f"{'ATTEMPTS:':<{label_width}} {attempts_value}")
+        print(f"{'TIME:':<{label_width}} {crack_time_value:.4f} seconds")
+        print(f"{'SPEED:':<{label_width}} {hps:.2f} hashes/sec")
+
+        print(f"{'PARSING TIME:':<{label_width}} {(ctx.parse_time * 1000):.2f} milliseconds")
+        print(f"{'DISPATCH LATENCY:':<{label_width}} {(ctx.dispatch_latency * 1000):.2f} milliseconds")
+        print(f"{'RESULT LATENCY:':<{label_width}} {(ctx.result_return_latency * 1000):.2f} milliseconds")
+
+        print("="*40)
 
         return State.CLEANUP
 
     except OSError as e:
         ctx.exit_message = f"ERROR: Failed to receive result. {e}"
         return State.ERROR
+
 
 
 def error(ctx: Context) -> State:

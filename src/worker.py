@@ -37,6 +37,7 @@ class Context:
     controller_sock: socket.socket | None = None
     worker_id: str | None = None
     job_data: dict | None = None
+    dispatch_latency: float | None = None
 
 
 def parse_arguments(ctx: Context) -> State:
@@ -132,12 +133,15 @@ def receive_job(ctx: Context) -> State:
         print("  Waiting for job from controller...")
 
         job = recv_msg(ctx.controller_sock)
+        dispatch_end_time = time.time()
+        dispatch_start_time = job.get("dispatch_start_time")
+        ctx.dispatch_latency = dispatch_end_time - dispatch_start_time
 
         if job.get("type") != "job":
             ctx.exit_message = f"ERROR: Unexpected message type: {job.get('type')}"
             return State.ERROR
 
-        ctx.job_data = job # Save the job for the CRACK state
+        ctx.job_data = job
         print(f"  Job #{job['job_id']} received from controller")
         return State.CRACK
 
@@ -192,6 +196,7 @@ def crack(ctx: Context) -> State:
 
 
 def send_result(ctx: Context) -> State:
+    send_result_start = time.time()
     if not ctx.job_data or "result" not in ctx.job_data:
         ctx.exit_message = "ERROR: No result data to send"
         return State.ERROR
@@ -205,7 +210,9 @@ def send_result(ctx: Context) -> State:
         "password": result["password"],
         "attempts": result["attempts"],
         "compute_time": result["compute_time"],
-        "status": result.get("status", "Completed")
+        "status": result.get("status", "Completed"),
+        "dispatch_latency": ctx.dispatch_latency,
+        "send_result_start": send_result_start
     }
 
     try:
