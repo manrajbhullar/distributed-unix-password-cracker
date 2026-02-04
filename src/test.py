@@ -30,5 +30,6 @@ def generate_shadow_file():
     except Exception as e:
         print(f"Error writing file: {e}")
 
+
 if __name__ == "__main__":
     generate_shadow_file()

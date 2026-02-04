@@ -8,7 +8,7 @@ import time
 import crypt
 import uuid
 import json
-from messaging import send_msg, recv_msg
+from messaging import send_msg, recv_msg, recv_with_timeout
 
 
 class State(Enum):
@@ -95,36 +95,32 @@ def connect(ctx: Context) -> State:
 
 def register(ctx: Context) -> State:
     if ctx.controller_sock is None:
-        ctx.exit_message = "ERROR: No controller socket to send registration request"
+        ctx.exit_message = "ERROR: No controller socket"
         return State.ERROR
 
     try:
         print("  Sending registration request...")
-        
-        ctx.controller_sock.settimeout(5.0)
 
         register_msg = {
             "type": "register",
             "worker_id": ctx.worker_id
         }
-
         send_msg(ctx.controller_sock, register_msg)
 
         print("  Waiting for approval from controller...")
-        register_resp = recv_msg(ctx.controller_sock)
+        register_resp = recv_with_timeout(ctx.controller_sock, 5.0)
 
         if register_resp.get("type") != "registration_ok":
-            ctx.exit_message = f"ERROR: Registration rejected. Reason: {register_resp.get('reason', register_resp)}"
+            ctx.exit_message = f"ERROR: Registration rejected"
             return State.ERROR
 
         print("  Worker registered successfully")
         return State.WAIT_JOB
 
-    except (socket.timeout, OSError, ValueError, json.JSONDecodeError) as e:
-        ctx.exit_message = f"ERROR: Registration with controller failed. {e}"
+    except Exception as e:
+        ctx.exit_message = f"ERROR: Registration failed. {e}"
         return State.ERROR
-    finally:
-        ctx.controller_sock.settimeout(None)
+
 
 
 def receive_job(ctx: Context) -> State:

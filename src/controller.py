@@ -6,7 +6,7 @@ import socket
 import json
 import time
 
-from messaging import send_msg, recv_msg
+from messaging import send_msg, recv_msg, recv_with_timeout
 
 
 # FSM states
@@ -203,45 +203,36 @@ def accept_worker(ctx: Context) -> State:
 
 def receive_registration(ctx: Context) -> State:
     if ctx.worker_sock is None:
-        ctx.exit_message = "ERROR: No worker socket to register"
+        ctx.exit_message = "ERROR: No worker socket"
         return State.ERROR
 
     try:
         print("  Waiting for worker to send registration request...")
-        ctx.worker_sock.settimeout(5.0)
 
-        registration_req = recv_msg(ctx.worker_sock)
+        registration_req = recv_with_timeout(ctx.worker_sock, 5.0)
 
         print("  Worker registration request received")
 
-        if registration_req.get("type") != "register" or not registration_req.get("worker_id"):
-
-            error_msg = {
+        if registration_req.get("type") != "register":
+            send_msg(ctx.worker_sock, {
                 "type": "registration_err",
                 "reason": "bad register"
-            }
-
-            send_msg(ctx.worker_sock, error_msg)
-            ctx.exit_message = f"ERROR: Bad registration message received"
+            })
             return State.ERROR
 
         ctx.worker_id = registration_req["worker_id"]
-
-        registration_resp = {
-            "type": "registration_ok",
-            "reason": "success"
-        }
-
-        send_msg(ctx.worker_sock, registration_resp)
+        time.sleep(10)
+        send_msg(ctx.worker_sock, {
+            "type": "registration_ok"
+        })
 
         print(f"  Worker registered successfully ({ctx.worker_id})")
         return State.DISPATCH_JOB
 
-    except (socket.timeout, OSError, ValueError, json.JSONDecodeError) as e:
+    except Exception as e:
         ctx.exit_message = f"ERROR: Worker failed to register. {e}"
         return State.WAIT_REGISTER
-    finally:
-        ctx.worker_sock.settimeout(None)
+
 
 
 def dispatch_job(ctx: Context) -> State:
