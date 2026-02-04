@@ -37,7 +37,7 @@ class Context:
     controller_sock: socket.socket | None = None
     worker_id: str | None = None
     job_data: dict | None = None
-    dispatch_latency: float | None = None
+    send_result_latency: float | None = None
 
 
 def parse_arguments(ctx: Context) -> State:
@@ -133,9 +133,8 @@ def receive_job(ctx: Context) -> State:
         print("  Waiting for job from controller...")
 
         job = recv_msg(ctx.controller_sock)
-        dispatch_end_time = time.time()
-        dispatch_start_time = job.get("dispatch_start_time")
-        ctx.dispatch_latency = dispatch_end_time - dispatch_start_time
+        ack = {"type": "job_ack", "job_id": job.get("job_id")}
+        send_msg(ctx.controller_sock, ack)
 
         if job.get("type") != "job":
             ctx.exit_message = f"ERROR: Unexpected message type: {job.get('type')}"
@@ -196,7 +195,6 @@ def crack(ctx: Context) -> State:
 
 
 def send_result(ctx: Context) -> State:
-    send_result_start = time.time()
     if not ctx.job_data or "result" not in ctx.job_data:
         ctx.exit_message = "ERROR: No result data to send"
         return State.ERROR
@@ -211,15 +209,24 @@ def send_result(ctx: Context) -> State:
         "attempts": result["attempts"],
         "compute_time": result["compute_time"],
         "status": result.get("status", "Completed"),
-        "dispatch_latency": ctx.dispatch_latency,
-        "send_result_start": send_result_start
     }
 
     try:
+        send_result_start = time.time()
         send_msg(ctx.controller_sock, result_msg)
+        ack = recv_msg(ctx.controller_sock)
+        if ack.get("type") != "result_ack":
+            ctx.exit_message = f"ERROR: Expected result_ack, got: {ack}"
+            return State.ERROR
+        send_result_end = time.time()
+        
+        ctx.send_result_latency = send_result_end - send_result_start
+        send_msg(ctx.controller_sock, {"result_return_latency": ctx.send_result_latency})
+        
         print("  Result sent to controller")
         print(f"\nJOB #1 COMPLETE")
         return State.CLEANUP
+    
     except OSError as e:
         ctx.exit_message = f"ERROR: Failed sending result. {e}"
         return State.ERROR

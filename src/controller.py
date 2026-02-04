@@ -245,8 +245,6 @@ def receive_registration(ctx: Context) -> State:
 
 
 def dispatch_job(ctx: Context) -> State:
-    dispatch_start_time = time.time()
-
     charset = (
         "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
         "abcdefghijklmnopqrstuvwxyz"
@@ -267,11 +265,18 @@ def dispatch_job(ctx: Context) -> State:
         "hash": ctx.pw_info.hash,
         "hash_full": ctx.pw_info.full,
         "charset": charset,
-        "dispatch_start_time": dispatch_start_time
     }
 
     try:
+        dispatch_start_time = time.time()
         send_msg(ctx.worker_sock, job)
+        ack = recv_msg(ctx.worker_sock)
+        if ack.get("type") != "job_ack" or ack.get("job_id") != ctx.job_id:
+            ctx.exit_message = f"ERROR: Expected job_ack, got: {ack}"
+            return State.ERROR
+        dispatch_end_time = time.time()
+        ctx.dispatch_latency = dispatch_end_time - dispatch_start_time
+        
         print(f"\nDISPATCHED JOB #{job['job_id']} (Worker: {ctx.worker_id})")
         return State.WAIT_RESULT
 
@@ -284,13 +289,12 @@ def wait_result(ctx: Context) -> State:
     print("  Waiting for worker to finish cracking...")
     try:
         result = recv_msg(ctx.worker_sock)
-
-        result_return_end = time.time()
-        result_return_start = result.get("send_result_start")
-        ctx.result_return_latency = result_return_end - result_return_start
-        ctx.dispatch_latency = result.get("dispatch_latency")
-
+        ack = {"type": "result_ack"}
+        send_msg(ctx.worker_sock, ack)
         print("  Worker has finished")
+
+        result_latency = recv_msg(ctx.worker_sock)
+        ctx.result_return_latency = result_latency["result_return_latency"]
         
         print("\n" + "="*40)
         print("            CRACKING RESULTS")
@@ -311,7 +315,7 @@ def wait_result(ctx: Context) -> State:
         else:
             hps = 0
 
-        label_width = 20   # Controls alignment of values
+        label_width = 20 
 
         print(f"{'STATUS:':<{label_width}} {status_value}")
         print(f"{'PASSWORD:':<{label_width}} {password_value}")
