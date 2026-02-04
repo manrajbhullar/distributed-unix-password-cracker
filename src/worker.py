@@ -6,8 +6,9 @@ import sys
 import itertools
 import time
 import crypt
-
-from helpers import send_msg, recv_msg
+import uuid
+import json
+from messaging import send_msg, recv_msg
 
 
 class State(Enum):
@@ -33,14 +34,15 @@ class Context:
     args: argparse.Namespace | None = None
     settings: Settings = field(default_factory=Settings)
     exit_message: str | None = None
-    sock: socket.socket | None = None  # connection to controller
+    controller_sock: socket.socket | None = None
+    worker_id: str | None = None
     job_data: dict | None = None
 
 
 def parse_arguments(ctx: Context) -> State:
     parser = argparse.ArgumentParser(
-        prog="UNIX Password Cracker Worker",
-        description="Worker node that connects to controller and executes cracking jobs."
+        prog="Distributed UNIX Password Cracker Worker",
+        description="Worker node for distributed UNIX password cracker that receives jobs from the control server."
     )
     
     parser.add_argument("-c", "--controller",
@@ -62,11 +64,14 @@ def handle_arguments(ctx: Context) -> State:
     args = ctx.args
 
     if not (1024 <= args.port <= 65535):
-        ctx.exit_message = "Port must be between 1024 and 65535"
+        ctx.exit_message = "ERROR: Port must be between 1024 and 65535"
         return State.ERROR
 
     ctx.settings.controller_host = args.controller
     ctx.settings.controller_port = args.port
+    ctx.worker_id = uuid.uuid4().hex
+    print(f"WORKER ID: {ctx.worker_id}")
+
     return State.CONNECT
 
 
@@ -77,52 +82,67 @@ def connect(ctx: Context) -> State:
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.connect((host, port))
-        ctx.sock = s
+        ctx.controller_sock = s
 
-        print(f"Connected to controller at {host}:{port}")
+        print(f"\nCONNECTED TO CONTROLLER: {host}:{port}")
         return State.REGISTER
 
     except OSError as e:
-        ctx.exit_message = f"Connect failed: {e}"
+        ctx.exit_message = f"ERROR: Connection attempt failed. {e}"
         return State.ERROR
 
 
 def register(ctx: Context) -> State:
+    if ctx.controller_sock is None:
+        ctx.exit_message = "ERROR: No controller socket to send registration request"
+        return State.ERROR
+
     try:
-        ctx.sock.sendall(b"REGISTER\n")
+        print("  Sending registration request...")
+        
+        ctx.controller_sock.settimeout(5.0)
 
-        data = ctx.sock.recv(64)
-        if not data:
-            ctx.exit_message = "Controller closed connection during registration"
+        register_msg = {
+            "type": "register",
+            "worker_id": ctx.worker_id
+        }
+
+        send_msg(ctx.controller_sock, register_msg)
+
+        print("  Waiting for approval from controller...")
+        register_resp = recv_msg(ctx.controller_sock)
+
+        if register_resp.get("type") != "registration_ok":
+            ctx.exit_message = f"ERROR: Registration rejected. Reason: {register_resp.get('reason', register_resp)}"
             return State.ERROR
 
-        msg = data.decode("utf-8", errors="replace").strip()
-        if msg != "OK":
-            ctx.exit_message = f"Registration rejected: {msg}"
-            return State.ERROR
-
-        print("Registered with controller")
+        print("  Worker registered successfully")
         return State.WAIT_JOB
 
-    except OSError as e:
-        ctx.exit_message = f"Register failed: {e}"
+    except (socket.timeout, OSError, ValueError, json.JSONDecodeError) as e:
+        ctx.exit_message = f"ERROR: Registration with controller failed. {e}"
         return State.ERROR
+    finally:
+        ctx.controller_sock.settimeout(None)
 
 
 def receive_job(ctx: Context) -> State:
     try:
-        job = recv_msg(ctx.sock)
+        print("\nWORKER READY")
+        print("  Waiting for job from controller...")
+
+        job = recv_msg(ctx.controller_sock)
 
         if job.get("type") != "job":
-            ctx.exit_message = f"Unexpected message type: {job.get('type')}"
+            ctx.exit_message = f"ERROR: Unexpected message type: {job.get('type')}"
             return State.ERROR
 
         ctx.job_data = job # Save the job for the CRACK state
-        print(f"Job {job['job_id']} received. Starting to crack...")
+        print(f"  Job #{job['job_id']} received from controller")
         return State.CRACK
 
     except OSError as e:
-        ctx.exit_message = f"Receive job failed: {e}"
+        ctx.exit_message = f"ERROR: Receiving job failed. {e}"
         return State.ERROR
 
 
@@ -131,7 +151,6 @@ def crack(ctx: Context) -> State:
     target_hash = job["hash_full"]
     charset = job["charset"]
     
-    # Pre-cache function lookups to avoid global lookups in the loop
     do_crypt = crypt.crypt
     do_join = "".join
     
@@ -140,30 +159,27 @@ def crack(ctx: Context) -> State:
     attempts = 0
     status_message = "Search Exhausted"
 
-    print(f"Cracking {job['username']}...")
+    print(f"\nJOB #{job['job_id']} STARTED")
+    print(f"  Cracking password (Username: {job['username']})")
     
     try:
         for length in itertools.count(1): 
-            # product() is a generator; it's fast. 
-            # But the 'for' loop around it is the Python bottleneck.
             for combo in itertools.product(charset, repeat=length):
                 attempts += 1
-                
-                # OPTIMIZATION: Call join directly inside the crypt call.
-                # This avoids creating a named variable 'candidate' in the local scope.
                 if do_crypt(do_join(combo), target_hash) == target_hash:
                     found_password = do_join(combo)
-                    break
-            
+                    break           
             if found_password:
                 break
                 
     except KeyboardInterrupt:
         status_message = "Manually Interrupted"
     except Exception as e:
-        status_message = f"Runtime Error: {str(e)}"
+        status_message = f"Runtime Error: {e}"
 
     end_time = time.time()
+    print(f"  Cracking process has completed")
+    
     ctx.job_data["result"] = {
         "found": found_password is not None,
         "password": found_password or "N/A",
@@ -177,46 +193,53 @@ def crack(ctx: Context) -> State:
 
 def send_result(ctx: Context) -> State:
     if not ctx.job_data or "result" not in ctx.job_data:
-        ctx.exit_message = "No result data to send"
+        ctx.exit_message = "ERROR: No result data to send"
         return State.ERROR
 
-    res = ctx.job_data["result"]
+    result = ctx.job_data["result"]
     
-    # Construct the message to send back
     result_msg = {
         "type": "result",
         "job_id": ctx.job_data["job_id"],
-        "found": res["found"],
-        "password": res["password"],
-        "attempts": res["attempts"],
-        "compute_time": res["compute_time"],
-        "status": res.get("status", "Completed")
+        "found": result["found"],
+        "password": result["password"],
+        "attempts": result["attempts"],
+        "compute_time": result["compute_time"],
+        "status": result.get("status", "Completed")
     }
 
     try:
-        send_msg(ctx.sock, result_msg)
-        print("Result sent to controller successfully.")
+        send_msg(ctx.controller_sock, result_msg)
+        print("  Result sent to controller")
+        print(f"\nJOB #1 COMPLETE")
         return State.CLEANUP
     except OSError as e:
-        ctx.exit_message = f"Socket error while sending result: {e}"
+        ctx.exit_message = f"ERROR: Failed sending result. {e}"
         return State.ERROR
 
 
 def error(ctx: Context) -> State:
-    print(ctx.exit_message or "Unknown error")
+    print(f"\n{ctx.exit_message}")
     return State.CLEANUP
 
 
 def cleanup(ctx: Context) -> State:
-    if ctx.sock:
-        ctx.sock.close()
+    if ctx.controller_sock:
+        ctx.controller_sock.close()
+    print("\nEXITING PROGRAM")
     sys.exit(0)
 
 
 def main():
+    print("--- WORKER ---")
+
+    # Program context
     ctx = Context()
+    
+    # Initialize first state
     state = State.PARSE_ARGS
 
+    # Handlers for each state
     handlers = {
         State.PARSE_ARGS: parse_arguments,
         State.HANDLE_ARGS: handle_arguments,
@@ -229,6 +252,7 @@ def main():
         State.CLEANUP: cleanup
     }
 
+    # FSM loop
     while True:
         state = handlers[state](ctx)
 

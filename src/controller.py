@@ -3,10 +3,12 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 import sys
 import socket
+import json
 
-from helpers import send_msg, recv_msg
+from messaging import send_msg, recv_msg
 
 
+# FSM states
 class State(Enum):
     PARSE_ARGS = auto()
     HANDLE_ARGS = auto()
@@ -20,6 +22,7 @@ class State(Enum):
     ERROR = auto()
 
 
+# Stores settings from command line
 @dataclass
 class Settings:
     filename: str | None = None
@@ -27,33 +30,40 @@ class Settings:
     port: int | None = None
 
 
+# Stores extracted password info from shadow file
 @dataclass
-class ShadowInfo:
+class PasswordInfo:
     alg_id: str | None = None
     salt: str | None = None
     hash: str | None = None
     full: str | None = None   
 
-
+# Stores program context needed within states
 @dataclass
 class Context:
     args: argparse.Namespace | None = None      
     settings: Settings = field(default_factory=Settings)
     exit_message: str | None = None
-    shadow: ShadowInfo = field(default_factory=ShadowInfo)
-    server_sock: socket.socket | None = None   # listening socket
-    worker_sock: socket.socket | None = None   # accepted connection
+    
+    pw_info: PasswordInfo = field(default_factory=PasswordInfo)
+    
+    server_sock: socket.socket | None = None  
+    worker_sock: socket.socket | None = None  
     worker_addr: tuple[str, int] | None = None
-    job_seq: int = 0
+    
+    worker_id: str | None = None    # Single worker registration id
+    job_id: int = 1     # Single job needed right now
+
 
 def next_job_id(ctx: Context) -> str:
     ctx.job_seq += 1
     return f"{ctx.job_seq:06d}"    
 
+
 def parse_arguments(ctx: Context) -> State:
     parser = argparse.ArgumentParser(
-        prog="UNIX Password Cracker Controller",
-        description="This is a control server that manages distributed password cracking.",
+        prog="Distributed UNIX Password Cracker Controller",
+        description="This is a control server that manages distributed password cracking on UNIX.",
         epilog=""
     )
     
@@ -80,45 +90,29 @@ def parse_arguments(ctx: Context) -> State:
     )
 
     ctx.args = parser.parse_args()
-    
     return State.HANDLE_ARGS
     
 
 def handle_arguments(ctx: Context) -> State:
     args = ctx.args
     if not (1024 <= args.port <= 65535):
-        ctx.exit_message = "Port must be between 1024 and 65535"
+        ctx.exit_message = "ERROR: Port must be between 1024 and 65535"
         return State.ERROR
 
     try:
         with open(args.filename, "r"):
             pass
     except FileNotFoundError:
-        ctx.exit_message = "Shadow file not found"
+        ctx.exit_message = "ERROR: Shadow file not found"
         return State.ERROR
     except PermissionError:
-        ctx.exit_message = "Shadow file not readable"
+        ctx.exit_message = "ERROR: Shadow file not readable"
         return State.ERROR
 
     ctx.settings.filename = args.filename
     ctx.settings.username = args.username
     ctx.settings.port = args.port
-
     return State.PARSE_SHADOW
-
-def cleanup(ctx: Context) -> State:
-    if ctx.worker_sock:
-        ctx.worker_sock.close()
-    if ctx.server_sock:
-        ctx.server_sock.close()
-
-    print("Exiting program")
-    sys.exit(0)
-
-
-def error(ctx: Context) -> State:
-    print(ctx.exit_message)
-    return State.CLEANUP
 
 
 def parse_shadow(ctx: Context) -> State:
@@ -126,7 +120,7 @@ def parse_shadow(ctx: Context) -> State:
     filename = ctx.settings.filename
 
     try:
-        with open(filename, "r", encoding="utf-8", errors="replace") as f:
+        with open(filename, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#"):
@@ -134,39 +128,39 @@ def parse_shadow(ctx: Context) -> State:
 
                 fields = line.split(":")
                 if len(fields) < 2:
-                    continue  # malformed line
+                    continue
 
                 user = fields[0]
-                pw_field = fields[1]
+                password = fields[1]
 
+                # If not target user, then skip line
                 if user != username:
                     continue
 
-                # Found the user
-                if pw_field in ("", "!", "*", "!!"):
-                    ctx.exit_message = f"User '{username}' has no usable hash (locked/empty)."
+                # If found target user, check if there is a usable hash
+                if password in ("", "!", "*", "!!"):
+                    ctx.exit_message = f"ERROR: User '{username}' has no usable hash"
                     return State.ERROR
 
                 # Store raw hash field
-                ctx.shadow.full = pw_field
+                ctx.pw_info.full = password
 
-                # Hash formats: $id$salt$hash  (per your class pdf) :contentReference[oaicite:2]{index=2}
-                if pw_field.startswith("$"):
-                    toks = pw_field.split("$")
-                    # Example: ["", "6", "randomsalt", "hashedpassword"]
-                    if len(toks) >= 2:
-                        ctx.shadow.alg_id = toks[1]
-                    if len(toks) >= 3:
-                        ctx.shadow.salt = toks[2]
-                    if len(toks) >= 4:
-                        ctx.shadow.hash = toks[3]
+                # Store individual parts of hash
+                if password.startswith("$"):
+                    tokens = password.split("$")
+                    if len(tokens) >= 2:
+                        ctx.pw_info.alg_id = tokens[1]
+                    if len(tokens) >= 3:
+                        ctx.pw_info.salt = tokens[2]
+                    if len(tokens) >= 4:
+                        ctx.pw_info.hash = tokens[3]
                 else:
-                    # Some systems may store non-$ formats; keep full and fail later if needed
-                    ctx.shadow.alg_id = None
+                    ctx.exit_message = f"ERROR: User hash failed to tokenize"
+                    return State.ERROR
 
                 return State.LISTEN 
     except:
-        ctx.exit_message = f"Username '{username}' not found in shadow file"
+        ctx.exit_message = f"ERROR: Username '{username}' not found in shadow file"
         return State.ERROR
 
 
@@ -179,12 +173,11 @@ def listen(ctx: Context) -> State:
         s.listen(1)
 
         ctx.server_sock = s
-        print(f"Listening on port {ctx.settings.port}")
-
+        print(f"LISTENING ON PORT: {ctx.settings.port}")
         return State.WAIT_REGISTER
 
     except OSError as e:
-        ctx.exit_message = f"Listen failed: {e}"
+        ctx.exit_message = f"ERROR: Control server failed to start. {e}"
         return State.ERROR
     
 
@@ -193,41 +186,58 @@ def accept_worker(ctx: Context) -> State:
         conn, addr = ctx.server_sock.accept()
         ctx.worker_sock = conn
         ctx.worker_addr = addr
-        print(f"Worker connected from {addr[0]}:{addr[1]}")
+        print(f"\nWORKER CONNECTED FROM: {addr[0]}:{addr[1]}")
         return State.RECEIVE_REGISTRATION
     except OSError as e:
-        ctx.exit_message = f"Accept failed: {e}"
+        ctx.exit_message = f"ERROR: Worker connection attempt failed. {e}"
         return State.ERROR
 
 
 def receive_registration(ctx: Context) -> State:
     if ctx.worker_sock is None:
-        ctx.exit_message = "No worker socket to register"
+        ctx.exit_message = "ERROR: No worker socket to register"
         return State.ERROR
 
     try:
-        data = ctx.worker_sock.recv(64)
-        if not data:
-            ctx.exit_message = "Worker disconnected before registering"
+        print("  Waiting for worker to send registration request...")
+        ctx.worker_sock.settimeout(5.0)
+
+        registration_req = recv_msg(ctx.worker_sock)
+
+        print("  Worker registration request received")
+
+        if registration_req.get("type") != "register" or not registration_req.get("worker_id"):
+
+            error_msg = {
+                "type": "registration_err",
+                "reason": "bad register"
+            }
+
+            send_msg(ctx.worker_sock, error_msg)
+            ctx.exit_message = f"ERROR: Bad registration message received"
             return State.ERROR
 
-        msg = data.decode("utf-8", errors="replace").strip()
-        if msg != "REGISTER":
-            ctx.worker_sock.sendall(b"ERR expected REGISTER\n")
-            ctx.exit_message = f"Bad registration message: {msg}"
-            return State.ERROR
+        ctx.worker_id = registration_req["worker_id"]
 
-        ctx.worker_sock.sendall(b"OK\n")
-        print("Worker registered")
+        registration_resp = {
+            "type": "registration_ok",
+            "reason": "success"
+        }
+
+        send_msg(ctx.worker_sock, registration_resp)
+
+        print(f"  Worker registered successfully ({ctx.worker_id})")
         return State.DISPATCH_JOB
 
-    except OSError as e:
-        ctx.exit_message = f"Registration recv failed: {e}"
-        return State.ERROR
+    except (socket.timeout, OSError, ValueError, json.JSONDecodeError) as e:
+        ctx.exit_message = f"ERROR: Worker failed to register. {e}"
+        return State.WAIT_REGISTER
+    finally:
+        ctx.worker_sock.settimeout(None)
 
 
 def dispatch_job(ctx: Context) -> State:
-    SAFE79 = (
+    charset = (
         "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
         "abcdefghijklmnopqrstuvwxyz"
         "0123456789"
@@ -240,29 +250,30 @@ def dispatch_job(ctx: Context) -> State:
 
     job = {
         "type": "job",
-        "job_id": next_job_id(ctx),
+        "job_id": ctx.job_id,
         "username": ctx.settings.username,
-        "alg_id": ctx.shadow.alg_id,
-        "salt": ctx.shadow.salt,
-        "hash": ctx.shadow.hash,
-        "hash_full": ctx.shadow.full,
-        "charset": SAFE79,
+        "alg_id": ctx.pw_info.alg_id,
+        "salt": ctx.pw_info.salt,
+        "hash": ctx.pw_info.hash,
+        "hash_full": ctx.pw_info.full,
+        "charset": charset,
     }
 
     try:
         send_msg(ctx.worker_sock, job)
-        print(f"Dispatched job {job['job_id']}")
+        print(f"\nDISPATCHED JOB #{job['job_id']} (Worker: {ctx.worker_id})")
         return State.WAIT_RESULT
 
     except OSError as e:
-        ctx.exit_message = f"Dispatch failed: {e}"
+        ctx.exit_message = f"ERROR: Dispatch of job to worker failed. {e}"
         return State.ERROR
 
+
 def wait_result(ctx: Context) -> State:
-    print("Waiting for worker to finish cracking...")
+    print("  Waiting for worker to finish cracking...")
     try:
-        # This will block until the worker sends the result dictionary
         result = recv_msg(ctx.worker_sock)
+        print("  Worker has finished")
         
         print("\n" + "="*30)
         print("      CRACKING RESULTS")
@@ -287,13 +298,35 @@ def wait_result(ctx: Context) -> State:
         return State.CLEANUP
 
     except OSError as e:
-        ctx.exit_message = f"Failed to receive result: {e}"
+        ctx.exit_message = f"ERROR: Failed to receive result. {e}"
         return State.ERROR
 
+
+def error(ctx: Context) -> State:
+    print(f"\n{ctx.exit_message}")
+    return State.CLEANUP
+
+
+def cleanup(ctx: Context) -> State:
+    if ctx.worker_sock:
+        ctx.worker_sock.close()
+    if ctx.server_sock:
+        ctx.server_sock.close()
+
+    print("\nEXITING PROGRAM")
+    sys.exit(0)
+
+
 def main():
+    print("--- CONTROLLER ---")
+    
+    # Program context
     ctx = Context()
+    
+    # Initialize first state
     state = State.PARSE_ARGS
 
+    # Handlers for each state
     handlers = {
         State.PARSE_ARGS: parse_arguments,
         State.HANDLE_ARGS: handle_arguments,
@@ -307,6 +340,7 @@ def main():
         State.CLEANUP: cleanup
     }
 
+    # FSM loop
     while True:
         state = handlers[state](ctx)
     
