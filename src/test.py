@@ -8,11 +8,11 @@ def generate_shadow_file():
 
     # Algorithm IDs required: yescrypt, bcrypt, SHA256, SHA512, MD5
     algs = {
-        "yescrypt": "$y$j9T$saltsaltsalt",
-        "bcrypt":   "$2b$12$saltsaltsaltsaltsaltse",
-        "sha256":   "$5$saltsalt",
-        "sha512":   "$6$saltsalt",
-        "md5":      "$1$saltsalt"
+        "yescrypt": "$y$j9T$saltsaltsalt",                    # lowest params
+        "bcrypt":   "$2b$04$saltsaltsaltsaltsaltse",          # lowest cost (04)
+        "sha256":   "$5$rounds=1000$saltsalt",                # minimum rounds
+        "sha512":   "$6$rounds=1000$saltsalt",                # minimum rounds
+        "md5":      "$1$saltsalt"                             # fixed
     }
 
     try:

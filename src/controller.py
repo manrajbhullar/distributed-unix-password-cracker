@@ -163,6 +163,11 @@ def parse_shadow(ctx: Context) -> State:
                 
                 ctx.parse_end = time.time()
                 ctx.parse_time = ctx.parse_end - ctx.parse_start
+
+                print(f"SHADOW FILE PARSED")
+                print(f"  Algorimth ID: {ctx.pw_info.alg_id}")
+                print(f"  Salt: {ctx.pw_info.salt}")
+                print(f"  Hash: {ctx.pw_info.hash}")
                 
                 return State.LISTEN
         ctx.exit_message = f"ERROR: Username '{username}' not found in shadow file"
@@ -181,7 +186,7 @@ def listen(ctx: Context) -> State:
         s.listen(1)
 
         ctx.server_sock = s
-        print(f"LISTENING ON PORT: {ctx.settings.port}")
+        print(f"\nLISTENING ON PORT: {ctx.settings.port}")
         return State.WAIT_REGISTER
 
     except OSError as e:
@@ -269,6 +274,7 @@ def dispatch_job(ctx: Context) -> State:
         ctx.dispatch_latency = dispatch_end_time - dispatch_start_time
         
         print(f"\nDISPATCHED JOB #{job['job_id']} (Worker: {ctx.worker_id})")
+        print(f"  Dispatch Latency: {(ctx.dispatch_latency * 1000):.2f} milliseconds (C -> W)")
         return State.WAIT_RESULT
 
     except OSError as e:

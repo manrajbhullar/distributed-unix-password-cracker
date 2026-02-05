@@ -3,11 +3,13 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 import socket
 import sys
-import itertools
 import time
-import crypt
+import itertools
 import uuid
 import json
+import crypt
+import bcrypt
+from passlib.hash import md5_crypt, sha256_crypt, sha512_crypt
 from messaging import send_msg, recv_msg, recv_with_timeout
 
 
@@ -145,29 +147,51 @@ def receive_job(ctx: Context) -> State:
         return State.ERROR
 
 
-def crack(ctx: Context) -> State:
+def crack(ctx):
     job = ctx.job_data
-    target_hash = job["hash_full"]
+    target_hash = job["hash_full"] 
     charset = job["charset"]
+    alg_id = job["alg_id"] 
     
-    do_crypt = crypt.crypt
-    do_join = "".join
-    
-    start_time = time.time()
     found_password = None
     attempts = 0
     status_message = "Search Exhausted"
 
     print(f"\nJOB #{job['job_id']} STARTED")
-    print(f"  Cracking password (Username: {job['username']})")
+    print(f"  Cracking password for user: {job['username']}")
+    
+    start_time = time.time()
     
     try:
+        # Loop through password lengths
         for length in itertools.count(1): 
+            print(f"  Testing passwords of length: {length}...")
+            
+            # Generate and check candidates
             for combo in itertools.product(charset, repeat=length):
                 attempts += 1
-                if do_crypt(do_join(combo), target_hash) == target_hash:
-                    found_password = do_join(combo)
+                candidate = "".join(combo)
+                
+                match = False
+                if alg_id == "1":
+                    match = md5_crypt.verify(candidate, target_hash)
+                
+                elif alg_id == "5":
+                    match = sha256_crypt.verify(candidate, target_hash)
+                
+                elif alg_id == "6":
+                    match = sha512_crypt.verify(candidate, target_hash)
+                
+                elif alg_id in ["2b", "2y", "2a"]:
+                    match = bcrypt.checkpw(candidate.encode(), target_hash.encode())
+                
+                elif alg_id == "y":
+                    match = crypt.crypt(candidate, target_hash) == target_hash
+
+                if match:
+                    found_password = candidate
                     break           
+            
             if found_password:
                 break
                 
@@ -177,7 +201,6 @@ def crack(ctx: Context) -> State:
         status_message = f"Runtime Error: {e}"
 
     end_time = time.time()
-    print(f"  Cracking process has completed")
     
     ctx.job_data["result"] = {
         "found": found_password is not None,
@@ -187,6 +210,7 @@ def crack(ctx: Context) -> State:
         "status": status_message if not found_password else "Success"
     }
     
+    print(f"  Cracking process has completed")
     return State.SEND_RESULT
 
 
@@ -219,7 +243,8 @@ def send_result(ctx: Context) -> State:
         ctx.send_result_latency = send_result_end - send_result_start
         send_msg(ctx.controller_sock, {"result_return_latency": ctx.send_result_latency})
         
-        print("  Result sent to controller")
+        print(f"\nRESULT SENT TO CONTROLLER")
+        print(f"  Result Return Latency: {(ctx.send_result_latency * 1000):.2f} milliseconds (W -> C)")
         print(f"\nJOB #1 COMPLETE")
         return State.CLEANUP
     
