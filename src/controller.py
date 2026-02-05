@@ -1,10 +1,9 @@
 import argparse
 from dataclasses import dataclass, field
 from enum import Enum, auto
-import sys
 import socket
+import sys
 import time
-
 from messaging import send_msg, recv_msg, recv_with_timeout
 
 
