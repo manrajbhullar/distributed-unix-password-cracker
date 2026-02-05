@@ -239,7 +239,7 @@ def receive_registration(ctx: Context) -> State:
             return State.ERROR
 
         ctx.worker_id = registration_req["worker_id"]
-        
+
         send_msg(ctx.worker_sock, {
             "type": "registration_ok"
         })
