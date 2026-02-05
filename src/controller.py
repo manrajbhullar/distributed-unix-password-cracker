@@ -56,6 +56,9 @@ class Context:
     parse_start: float | None = None
     parse_end: float | None = None
     parse_time: float | None = None
+    runtime_start: float | None = None
+    runtime_end: float | None = None
+    runtime: float | None = None
     dispatch_latency: float | None = None
     result_return_latency: float | None = None
 
@@ -238,6 +241,8 @@ def receive_registration(ctx: Context) -> State:
 
 
 def dispatch_job(ctx: Context) -> State:
+    ctx.runtime_start = time.time()
+    
     charset = (
         "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
         "abcdefghijklmnopqrstuvwxyz"
@@ -309,8 +314,10 @@ def wait_result(ctx: Context) -> State:
         else:
             hps = 0
 
+        ctx.runtime_end = time.time()
+        ctx.runtime = ctx.runtime_end - ctx.runtime_start
+        
         label_width = 20 
-
         print(f"{'STATUS:':<{label_width}} {status_value}")
         print(f"{'PASSWORD:':<{label_width}} {password_value}")
         print(f"{'ATTEMPTS:':<{label_width}} {attempts_value}")
@@ -319,7 +326,7 @@ def wait_result(ctx: Context) -> State:
         print(f"{'PARSING TIME:':<{label_width}} {(ctx.parse_time * 1000):.2f} milliseconds")
         print(f"{'DISPATCH LATENCY:':<{label_width}} {(ctx.dispatch_latency * 1000):.2f} milliseconds")
         print(f"{'RESULT LATENCY:':<{label_width}} {(ctx.result_return_latency * 1000):.2f} milliseconds")
-
+        print(f"{'E2E RUNTIME:':<{label_width}} {ctx.runtime:.2f} seconds")
         print("="*40)
 
         return State.CLEANUP

@@ -140,7 +140,7 @@ def receive_job(ctx: Context) -> State:
             return State.ERROR
 
         ctx.job_data = job
-        print(f"  Job #{job['job_id']} received from controller - (User: {job['username']}, Alg_ID: {job['alg_id']})")
+        print(f"  Job #{job['job_id']} received from controller -> (User: {job['username']}, Alg_ID: {job['alg_id']})")
         return State.CRACK
 
     except OSError as e:
