@@ -3,7 +3,6 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 import sys
 import socket
-import json
 import time
 
 from messaging import send_msg, recv_msg, recv_with_timeout
@@ -60,7 +59,6 @@ class Context:
     parse_time: float | None = None
     dispatch_latency: float | None = None
     result_return_latency: float | None = None
-
 
 
 def parse_arguments(ctx: Context) -> State:
@@ -179,7 +177,6 @@ def parse_shadow(ctx: Context) -> State:
         return State.ERROR
 
 
-
 def listen(ctx: Context) -> State:
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -239,7 +236,6 @@ def receive_registration(ctx: Context) -> State:
     except Exception as e:
         ctx.exit_message = f"ERROR: Worker failed to register. {e}"
         return State.WAIT_REGISTER
-
 
 
 def dispatch_job(ctx: Context) -> State:
@@ -321,7 +317,6 @@ def wait_result(ctx: Context) -> State:
         print(f"{'ATTEMPTS:':<{label_width}} {attempts_value}")
         print(f"{'TIME:':<{label_width}} {crack_time_value:.2f} seconds")
         print(f"{'SPEED:':<{label_width}} {hps:.2f} hashes/sec")
-
         print(f"{'PARSING TIME:':<{label_width}} {(ctx.parse_time * 1000):.2f} milliseconds")
         print(f"{'DISPATCH LATENCY:':<{label_width}} {(ctx.dispatch_latency * 1000):.2f} milliseconds")
         print(f"{'RESULT LATENCY:':<{label_width}} {(ctx.result_return_latency * 1000):.2f} milliseconds")
@@ -374,8 +369,11 @@ def main():
     }
 
     # FSM loop
-    while True:
-        state = handlers[state](ctx)
+    try:
+        while True:
+            state = handlers[state](ctx)
+    except KeyboardInterrupt:
+        handlers[State.CLEANUP](ctx)
     
 
 if __name__ == "__main__":

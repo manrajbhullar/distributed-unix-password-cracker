@@ -126,7 +126,6 @@ def register(ctx: Context) -> State:
         return State.ERROR
 
 
-
 def receive_job(ctx: Context) -> State:
     try:
         print("\nWORKER READY")
@@ -157,7 +156,7 @@ def crack(ctx):
     
     found_password = None
     attempts = 0
-    status_message = "Search Exhausted"
+    status_message = "Search Exhausted"  # Base case
 
     print(f"\nJOB #{job['job_id']} STARTED")
     print(f"  Cracking password...")
@@ -290,10 +289,12 @@ def main():
     }
 
     # FSM loop
-    while True:
-        state = handlers[state](ctx)
+    try:
+        while True:
+            state = handlers[state](ctx)
+    except KeyboardInterrupt:
+        handlers[State.CLEANUP](ctx)
 
 
 if __name__ == "__main__":
     main()
-
