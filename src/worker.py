@@ -7,6 +7,8 @@ import time
 import itertools
 import uuid
 import json
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 import crypt
 import bcrypt
 from passlib.hash import md5_crypt, sha256_crypt, sha512_crypt
@@ -73,7 +75,7 @@ def handle_arguments(ctx: Context) -> State:
     ctx.settings.controller_host = args.controller
     ctx.settings.controller_port = args.port
     ctx.worker_id = uuid.uuid4().hex
-    print(f"WORKER ID: {ctx.worker_id}")
+    print(f"\nWORKER ID: {ctx.worker_id}")
 
     return State.CONNECT
 
@@ -139,7 +141,7 @@ def receive_job(ctx: Context) -> State:
             return State.ERROR
 
         ctx.job_data = job
-        print(f"  Job #{job['job_id']} received from controller")
+        print(f"  Job #{job['job_id']} received from controller - (User: {job['username']}, Alg_ID: {job['alg_id']})")
         return State.CRACK
 
     except OSError as e:
@@ -158,7 +160,7 @@ def crack(ctx):
     status_message = "Search Exhausted"
 
     print(f"\nJOB #{job['job_id']} STARTED")
-    print(f"  Cracking password for user: {job['username']}")
+    print(f"  Cracking password...")
     
     start_time = time.time()
     

@@ -164,10 +164,12 @@ def parse_shadow(ctx: Context) -> State:
                 ctx.parse_end = time.time()
                 ctx.parse_time = ctx.parse_end - ctx.parse_start
 
-                print(f"SHADOW FILE PARSED")
-                print(f"  Algorimth ID: {ctx.pw_info.alg_id}")
+                print(f"\nPARSED SHADOW FILE")
+                print(f"  User: {ctx.settings.username}")
+                print(f"  Alg_ID: {ctx.pw_info.alg_id}")
                 print(f"  Salt: {ctx.pw_info.salt}")
                 print(f"  Hash: {ctx.pw_info.hash}")
+                print(f"  Duration: {(ctx.parse_time * 1000):.2f} milliseconds")
                 
                 return State.LISTEN
         ctx.exit_message = f"ERROR: Username '{username}' not found in shadow file"
