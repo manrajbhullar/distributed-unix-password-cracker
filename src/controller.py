@@ -122,7 +122,8 @@ def parse_shadow(ctx: Context) -> State:
     filename = ctx.settings.filename
    
     try:
-        ctx.parse_start = time.time() 
+        ctx.parse_start = time.time()
+
         with open(filename, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -136,27 +137,36 @@ def parse_shadow(ctx: Context) -> State:
                 user = fields[0]
                 password = fields[1]
 
-                # If not target user, then skip line
+                # Skip if not right user
                 if user != username:
                     continue
 
-                # If found target user, check if there is a usable hash
+                # Unusable hash
                 if password in ("", "!", "*", "!!"):
                     ctx.exit_message = f"ERROR: User '{username}' has no usable hash"
                     return State.ERROR
 
-                # Store raw hash field
                 ctx.pw_info.full = password
 
-                # Store individual parts of hash
                 if password.startswith("$"):
                     tokens = password.split("$")
-                    if len(tokens) >= 2:
-                        ctx.pw_info.alg_id = tokens[1]
-                    if len(tokens) >= 3:
+                    ctx.pw_info.alg_id = tokens[1]
+
+                    # md5
+                    if ctx.pw_info.alg_id == "1":
                         ctx.pw_info.salt = tokens[2]
-                    if len(tokens) >= 4:
                         ctx.pw_info.hash = tokens[3]
+
+                    # bcrypt (salt+hash combined)
+                    elif ctx.pw_info.alg_id in ("2a", "2b", "2x", "2y"):
+                        combined = tokens[3]
+                        ctx.pw_info.salt = combined[:22]
+                        ctx.pw_info.hash = combined[22:]
+
+                    # sha256/sha512/yescrypt
+                    else:
+                        ctx.pw_info.salt = tokens[3]
+                        ctx.pw_info.hash = tokens[4]
                 else:
                     ctx.exit_message = f"ERROR: User hash failed to tokenize"
                     return State.ERROR
@@ -170,12 +180,14 @@ def parse_shadow(ctx: Context) -> State:
                 print(f"  Salt: {ctx.pw_info.salt}")
                 print(f"  Hash: {ctx.pw_info.hash}")
                 print(f"  Duration: {(ctx.parse_time * 1000):.2f} milliseconds")
-                
+
                 return State.LISTEN
+
         ctx.exit_message = f"ERROR: Username '{username}' not found in shadow file"
         return State.ERROR
-    except:
-        ctx.exit_message = f"ERROR: Failed to parse shadow file. {e}"
+
+    except Exception:
+        ctx.exit_message = f"ERROR: Failed to parse shadow file"
         return State.ERROR
 
 
