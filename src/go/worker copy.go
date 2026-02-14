@@ -1,14 +1,8 @@
 package main
 
-/*
-#cgo LDFLAGS: -lcrypt
-#include <crypt.h>
-#include <stdlib.h>
-*/
-import "C"
-
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -21,8 +15,6 @@ import (
 	"strings"
 	"syscall"
 	"time"
-	"crypto/subtle"
-	"unsafe"
 
 	"github.com/tredoe/crypt"
 	_ "github.com/tredoe/crypt/md5_crypt"
@@ -30,27 +22,8 @@ import (
 	_ "github.com/tredoe/crypt/sha512_crypt"
 
 	xbcrypt "golang.org/x/crypto/bcrypt"
+	"github.com/go-crypt/x/yescrypt"
 )
-
-
-func verifyYescrypt(candidate, fullHash string) bool {
-	cCand := C.CString(candidate)
-	cSetting := C.CString(fullHash)
-	defer C.free(unsafe.Pointer(cCand))
-	defer C.free(unsafe.Pointer(cSetting))
-
-	var data C.struct_crypt_data
-	data.initialized = 0
-
-	out := C.crypt_r(cCand, cSetting, &data)
-	if out == nil {
-		return false
-	}
-
-	got := C.GoString(out)
-	return subtle.ConstantTimeCompare([]byte(got), []byte(fullHash)) == 1
-}
-
 
 //
 // ---------------- messaging (same as messaging.py) ----------------
@@ -358,7 +331,8 @@ func crack(ctx *Context) State {
 
 
 			} else if alg_id == "y" {
-				match = verifyYescrypt(candidate, target_hash)
+				out, err := yescrypt.Hash([]byte(candidate), []byte(target_hash)) // target_hash is the full "$y$..." string
+				match = (err == nil && subtle.ConstantTimeCompare(out, []byte(target_hash)) == 1)
 			}
 
 			if match {
