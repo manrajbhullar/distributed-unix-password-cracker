@@ -2,5 +2,5 @@ venv/
 .venv/
 __pycache__/
 build/
-documentation/
+docs/
 shadow
