@@ -17,7 +17,6 @@ import (
 	"time"
 )
 
-
 func sendMsg(conn net.Conn, msg map[string]any) error {
 	b, err := json.Marshal(msg)
 	if err != nil {
@@ -34,7 +33,6 @@ func sendMsg(conn net.Conn, msg map[string]any) error {
 	_, err = conn.Write(b)
 	return err
 }
-
 
 func recvMsg(conn net.Conn) (map[string]any, error) {
 	var hdr [4]byte
@@ -58,14 +56,12 @@ func recvMsg(conn net.Conn) (map[string]any, error) {
 	return out, nil
 }
 
-
 func recvWithTimeout(conn net.Conn, timeout time.Duration) (map[string]any, error) {
 	_ = conn.SetReadDeadline(time.Now().Add(timeout))
 	msg, err := recvMsg(conn)
 	_ = conn.SetReadDeadline(time.Time{}) // clear deadline
 	return msg, err
 }
-
 
 type State int
 
@@ -82,13 +78,11 @@ const (
 	StateError
 )
 
-
 type Settings struct {
 	Filename string
 	Username string
 	Port     int
 }
-
 
 type PasswordInfo struct {
 	AlgID string
@@ -96,7 +90,6 @@ type PasswordInfo struct {
 	Hash  string
 	Full  string
 }
-
 
 type Context struct {
 	Settings    Settings
@@ -123,9 +116,7 @@ type Context struct {
 	ResultReturnLatency *float64
 }
 
-
 type Handler func(*Context) State
-
 
 func parseArguments(ctx *Context) State {
 	fs := flag.NewFlagSet("Distributed UNIX Password Cracker Controller", flag.ContinueOnError)
@@ -158,7 +149,6 @@ func parseArguments(ctx *Context) State {
 	return StateHandleArgs
 }
 
-
 func handleArguments(ctx *Context) State {
 	port := ctx.Settings.Port
 	if port < 1024 || port > 65535 {
@@ -183,7 +173,6 @@ func handleArguments(ctx *Context) State {
 
 	return StateParseShadow
 }
-
 
 func parseShadow(ctx *Context) State {
 	username := ctx.Settings.Username
@@ -297,7 +286,6 @@ func parseShadow(ctx *Context) State {
 	return StateError
 }
 
-
 func listen(ctx *Context) State {
 	ln, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", ctx.Settings.Port))
 	if err != nil {
@@ -308,7 +296,6 @@ func listen(ctx *Context) State {
 	fmt.Printf("\nLISTENING ON PORT: %d\n", ctx.Settings.Port)
 	return StateWaitRegister
 }
-
 
 func acceptWorker(ctx *Context) State {
 	if ctx.ServerLn == nil {
@@ -329,7 +316,6 @@ func acceptWorker(ctx *Context) State {
 	fmt.Printf("\nWORKER CONNECTED FROM: %s\n", ctx.WorkerAddr)
 	return StateReceiveRegistration
 }
-
 
 func receiveRegistration(ctx *Context) State {
 	if ctx.WorkerConn == nil {
@@ -362,7 +348,6 @@ func receiveRegistration(ctx *Context) State {
 	fmt.Printf("  Worker registered successfully (%s)\n", ctx.WorkerID)
 	return StateDispatchJob
 }
-
 
 func dispatchJob(ctx *Context) State {
 	now := time.Now()
@@ -416,7 +401,6 @@ func dispatchJob(ctx *Context) State {
 	fmt.Printf("  Dispatch Latency: %.2f milliseconds (C -> W)\n", lat*1000)
 	return StateWaitResult
 }
-
 
 func waitResult(ctx *Context) State {
 	fmt.Println("  Waiting for worker to finish cracking...")
@@ -502,12 +486,10 @@ func waitResult(ctx *Context) State {
 	return StateCleanup
 }
 
-
 func controllerError(ctx *Context) State {
 	fmt.Printf("\n%s\n", ctx.ExitMessage)
 	return StateCleanup
 }
-
 
 func cleanup(ctx *Context) State {
 	if ctx.WorkerConn != nil {
@@ -604,10 +586,8 @@ func boolFromAny(v any) bool {
 	}
 }
 
-//
 // ---------- optional: pretty-print a map like Python debug ----------
 // (Not used, but helpful if you’re troubleshooting mismatched worker messages.)
-//
 func debugMap(m map[string]any) string {
 	b, _ := json.MarshalIndent(m, "", "  ")
 	return string(bytes.TrimSpace(b))
