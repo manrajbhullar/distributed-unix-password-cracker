@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -235,7 +236,8 @@ func connect(ctx *Context) State {
 	host := ctx.Settings.ControllerHost
 	port := ctx.Settings.ControllerPort
 
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", host, port))
+	//conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", host, port))
+	conn, err := net.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
 	if err != nil {
 		ctx.ExitMessage = fmt.Sprintf("ERROR: Connection attempt failed. %v", err)
 		return StateError
@@ -436,6 +438,7 @@ func crack(ctx *Context) State {
 
 	// worker: consume candidates and verify
 	worker := func(id int) {
+		_ = id
 		defer wg.Done()
 		localAttempts := 0
 
