@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 USERNAME="manraj"
-PASSWORD="lag"
+PASSWORD="ZZZ"
 OUT="shadow"
 
 # Cost Settings

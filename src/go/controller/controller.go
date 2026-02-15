@@ -353,8 +353,8 @@ func dispatchJob(ctx *Context) State {
 	now := time.Now()
 	ctx.RuntimeStart = &now
 
-	charset := "ABCDEFGHIJKLMNOPQRSTUVWXYZ" +
-		"abcdefghijklmnopqrstuvwxyz" +
+	charset := "abcdefghijklmnopqrstuvwxyz" +
+		"ABCDEFGHIJKLMNOPQRSTUVWXYZ" +
 		"0123456789" +
 		"@#%^&*()_+-=.,:;?"
 

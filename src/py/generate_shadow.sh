@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 USERNAME="manraj"
-PASSWORD="DoG"
+PASSWORD="aa"
 OUT="shadow"
 
 # Cost Settings

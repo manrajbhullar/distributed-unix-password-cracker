@@ -9,6 +9,7 @@ import "C"
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -18,10 +19,12 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
-	"crypto/subtle"
 	"unsafe"
 
 	"github.com/tredoe/crypt"
@@ -31,7 +34,6 @@ import (
 
 	xbcrypt "golang.org/x/crypto/bcrypt"
 )
-
 
 func verifyYescrypt(candidate, fullHash string) bool {
 	cCand := C.CString(candidate)
@@ -50,7 +52,6 @@ func verifyYescrypt(candidate, fullHash string) bool {
 	got := C.GoString(out)
 	return subtle.ConstantTimeCompare([]byte(got), []byte(fullHash)) == 1
 }
-
 
 //
 // ---------------- messaging (same as messaging.py) ----------------
@@ -131,6 +132,7 @@ const (
 type Settings struct {
 	ControllerHost string
 	ControllerPort int
+	Threads        int
 }
 
 type Context struct {
@@ -185,10 +187,11 @@ func parse_arguments(ctx *Context) State {
 
 	var controller string
 	var port int
+	var threads int
 
-	// Short flags only
 	fs.StringVar(&controller, "c", "", "Controller host or IP")
 	fs.IntVar(&port, "p", 0, "Controller port")
+	fs.IntVar(&threads, "t", 1, "Number of threads")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		ctx.ExitMessage = err.Error()
@@ -204,6 +207,8 @@ func parse_arguments(ctx *Context) State {
 
 	ctx.Settings.ControllerHost = controller
 	ctx.Settings.ControllerPort = port
+	ctx.Settings.Threads = threads
+
 	return StateHandleArgs
 }
 
@@ -214,8 +219,14 @@ func handle_arguments(ctx *Context) State {
 		return StateError
 	}
 
+	if ctx.Settings.Threads <= 0 {
+		ctx.ExitMessage = "ERROR: Threads must be greater than 0"
+		return StateError
+	}
+
 	ctx.WorkerID = newUUIDHexLikePython()
 	fmt.Printf("\nWORKER ID: %s\n", ctx.WorkerID)
+	fmt.Printf("THREADS: %d\n", ctx.Settings.Threads)
 
 	return StateConnect
 }
@@ -301,103 +312,206 @@ func receive_job(ctx *Context) State {
 
 func crack(ctx *Context) State {
 	job := ctx.JobData
+	threads := ctx.Settings.Threads
 
-	target_hash := strFromAny(job["hash_full"])
+	targetHash := strFromAny(job["hash_full"])
 	charset := strFromAny(job["charset"])
 	alg_id := strFromAny(job["alg_id"])
 
-	found_password := ""
-	attempts := 0
-	status_message := "Search Exhausted"
-
 	fmt.Printf("\nJOB #%d STARTED\n", intFromAny(job["job_id"]))
-	fmt.Printf("  Cracking password...\n")
+	fmt.Printf("  Cracking password with %d threads...\n", threads)
 
-	start_time := time.Now()
+	startTime := time.Now()
 
-	for length := 1; ; length++ {
-		fmt.Printf("  Testing passwords of length: %d...\n", length)
+	// control structures
+	jobs := make(chan string, 1<<12)
+	var foundFlag int32 = 0     // 0 = not found, 1 = found/interrupted
+	var totalAttempts int64 = 0 // atomic counter
+	var wg sync.WaitGroup
+	var foundMu sync.Mutex
+	var foundPassword string
+	statusMessage := "Search Exhausted"
 
-		base := len(charset)
-		idx := make([]int, length)
+	// helper: verify candidate according to alg_id
+	verifyCandidate := func(candidate string) bool {
+		switch alg_id {
+		case "1":
+			c := crypt.MD5.New()
+			return c.Verify(targetHash, []byte(candidate)) == nil
+		case "5":
+			c := crypt.SHA256.New()
+			return c.Verify(targetHash, []byte(candidate)) == nil
+		case "6":
+			c := crypt.SHA512.New()
+			return c.Verify(targetHash, []byte(candidate)) == nil
+		case "2b", "2y", "2a":
+			if err := xbcrypt.CompareHashAndPassword([]byte(targetHash), []byte(candidate)); err == nil {
+				return true
+			}
+			return false
+		case "y":
+			return verifyYescrypt(candidate, targetHash)
+		default:
+			// unknown algorithm: attempt a best-effort SHA256 (or always false)
+			c := crypt.SHA256.New()
+			return c.Verify(targetHash, []byte(candidate)) == nil
+		}
+	}
 
+	// monitor goroutine: if ctx.InterruptedCrack is set by signal handler, flip foundFlag
+	go func() {
 		for {
 			if ctx.InterruptedCrack {
-				status_message = "Manually Interrupted"
-				goto done
+				// indicate interruption so generator/workers stop
+				atomic.StoreInt32(&foundFlag, 1)
+				// set status message (thread-safe)
+				foundMu.Lock()
+				statusMessage = "Manually Interrupted"
+				foundMu.Unlock()
+				return
 			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}()
 
-			attempts++
+	// generator: produce candidates length by length
+	generator := func() {
+		defer close(jobs)
 
-			var sb strings.Builder
-			for i := 0; i < length; i++ {
-				sb.WriteByte(charset[idx[i]])
-			}
-			candidate := sb.String()
+		base := len(charset)
+		if base == 0 {
+			return
+		}
 
-			match := false
+		for length := 1; ; length++ {
+			// print new-length header
+			fmt.Printf("  Testing passwords of length: %d...\n", length)
 
-			if alg_id == "1" {
-				c := crypt.MD5.New()
-				err := c.Verify(target_hash, []byte(candidate))
-				match = (err == nil)
+			idx := make([]int, length)
+			for {
+				// stop if found or interrupted
+				if atomic.LoadInt32(&foundFlag) != 0 {
+					return
+				}
 
-			} else if alg_id == "5" {
-				c := crypt.SHA256.New()
-				err := c.Verify(target_hash, []byte(candidate))
-				match = (err == nil)
+				var sb strings.Builder
+				for i := 0; i < length; i++ {
+					sb.WriteByte(charset[idx[i]])
+				}
+				candidate := sb.String()
 
-			} else if alg_id == "6" {
-				c := crypt.SHA512.New()
-				err := c.Verify(target_hash, []byte(candidate))
-				match = (err == nil)
+				// send candidate (block if needed, but wake up if found)
+				select {
+				case jobs <- candidate:
+					// sent
+				default:
+					select {
+					case jobs <- candidate:
+					case <-time.After(10 * time.Millisecond):
+						if atomic.LoadInt32(&foundFlag) != 0 {
+							return
+						}
+						// try a final send (will block until free or found)
+						jobs <- candidate
+					}
+				}
 
-			} else if alg_id == "2b" || alg_id == "2y" || alg_id == "2a" {
-				err := xbcrypt.CompareHashAndPassword([]byte(target_hash), []byte(candidate))
-				match = (err == nil)
-
-
-			} else if alg_id == "y" {
-				match = verifyYescrypt(candidate, target_hash)
-			}
-
-			if match {
-				found_password = candidate
-				goto done
-			}
-
-			pos := length - 1
-			for pos >= 0 {
-				idx[pos]++
-				if idx[pos] < base {
+				// advance odometer
+				pos := length - 1
+				for pos >= 0 {
+					idx[pos]++
+					if idx[pos] < base {
+						break
+					}
+					idx[pos] = 0
+					pos--
+				}
+				if pos < 0 {
+					// exhausted this length
 					break
 				}
-				idx[pos] = 0
-				pos--
-			}
-			if pos < 0 {
-				break
 			}
 		}
 	}
 
-done:
-	end_time := time.Now()
+	// worker: consume candidates and verify
+	worker := func(id int) {
+		defer wg.Done()
+		localAttempts := 0
 
-	result_status := status_message
-	if found_password != "" {
-		result_status = "Success"
+		for candidate := range jobs {
+			// quit early if found/interrupted
+			if atomic.LoadInt32(&foundFlag) != 0 {
+				return
+			}
+
+			// count attempt
+			localAttempts++
+			atomic.AddInt64(&totalAttempts, 1)
+
+			// verify
+			if verifyCandidate(candidate) {
+				// attempt to announce found (only one worker should succeed here)
+				if atomic.CompareAndSwapInt32(&foundFlag, 0, 1) {
+					// record found password and print summary
+					foundMu.Lock()
+					foundPassword = candidate
+					foundMu.Unlock()
+				}
+				return
+			}
+
+			// quick exit if someone else found it meanwhile
+			if atomic.LoadInt32(&foundFlag) != 0 {
+				return
+			}
+		}
 	}
 
+	// set runtime parallelism to threads (honor provided count)
+	runtime.GOMAXPROCS(threads)
+
+	// start generator
+	go generator()
+
+	// spawn workers
+	wg.Add(threads)
+	for t := 0; t < threads; t++ {
+		go worker(t)
+	}
+
+	// wait for workers to finish
+	wg.Wait()
+
+	endTime := time.Now()
+
+	// determine final status
+	finalFound := ""
+	foundMu.Lock()
+	finalFound = foundPassword
+	// if interrupted but no password, statusMessage was set by monitor goroutine
+	foundMu.Unlock()
+
+	if finalFound != "" {
+		statusMessage = "Success"
+	}
+
+	// fill job result (attempts and compute_time)
 	job["result"] = map[string]any{
-		"found":        found_password != "",
-		"password":     func() string { if found_password != "" { return found_password }; return "N/A" }(),
-		"compute_time": end_time.Sub(start_time).Seconds(),
-		"attempts":     attempts,
-		"status":       result_status,
+		"found": finalFound != "",
+		"password": func() string {
+			if finalFound != "" {
+				return finalFound
+			}
+			return "N/A"
+		}(),
+		"compute_time": endTime.Sub(startTime).Seconds(),
+		"attempts":     int(atomic.LoadInt64(&totalAttempts)),
+		"status":       statusMessage,
 	}
 
 	fmt.Printf("  Cracking process has completed\n")
+	fmt.Printf("  Total Attempts: %d\n", atomic.LoadInt64(&totalAttempts))
 	return StateSendResult
 }
 
