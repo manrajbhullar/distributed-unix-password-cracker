@@ -36,86 +36,6 @@ import (
 	xbcrypt "golang.org/x/crypto/bcrypt"
 )
 
-func verifyYescrypt(candidate, fullHash string) bool {
-	cCand := C.CString(candidate)
-	cSetting := C.CString(fullHash)
-	defer C.free(unsafe.Pointer(cCand))
-	defer C.free(unsafe.Pointer(cSetting))
-
-	var data C.struct_crypt_data
-	data.initialized = 0
-
-	out := C.crypt_r(cCand, cSetting, &data)
-	if out == nil {
-		return false
-	}
-
-	got := C.GoString(out)
-	return subtle.ConstantTimeCompare([]byte(got), []byte(fullHash)) == 1
-}
-
-//
-// ---------------- messaging (same as messaging.py) ----------------
-// 4-byte big-endian length prefix + compact JSON
-//
-
-func sendMsg(conn net.Conn, obj any) error {
-	payload, err := json.Marshal(obj)
-	if err != nil {
-		return err
-	}
-
-	var hdr [4]byte
-	binary.BigEndian.PutUint32(hdr[:], uint32(len(payload)))
-
-	if _, err := conn.Write(hdr[:]); err != nil {
-		return err
-	}
-	_, err = conn.Write(payload)
-	return err
-}
-
-func recvExact(conn net.Conn, n int) ([]byte, error) {
-	buf := make([]byte, n)
-	_, err := io.ReadFull(conn, buf)
-	if err != nil {
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			return nil, fmt.Errorf("ERROR: Connection closed while reading data")
-		}
-		return nil, err
-	}
-	return buf, nil
-}
-
-func recvMsg(conn net.Conn) (map[string]any, error) {
-	hdr, err := recvExact(conn, 4)
-	if err != nil {
-		return nil, err
-	}
-	n := binary.BigEndian.Uint32(hdr)
-	payload, err := recvExact(conn, int(n))
-	if err != nil {
-		return nil, err
-	}
-
-	var out map[string]any
-	if err := json.Unmarshal(payload, &out); err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func recvWithTimeout(conn net.Conn, seconds float64) (map[string]any, error) {
-	_ = conn.SetReadDeadline(time.Now().Add(time.Duration(seconds * float64(time.Second))))
-	msg, err := recvMsg(conn)
-	_ = conn.SetReadDeadline(time.Time{})
-	return msg, err
-}
-
-//
-// ---------------- FSM types ----------------
-//
-
 type State int
 
 const (
@@ -151,36 +71,6 @@ type Context struct {
 }
 
 type Handler func(*Context) State
-
-//
-// ---------------- helpers ----------------
-//
-
-func newUUIDHexLikePython() string {
-	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
-}
-
-func strFromAny(v any) string {
-	s, _ := v.(string)
-	return s
-}
-
-func intFromAny(v any) int {
-	switch x := v.(type) {
-	case float64:
-		return int(x)
-	case int:
-		return x
-	default:
-		return 0
-	}
-}
-
-//
-// ---------------- states ----------------
-//
 
 func parse_arguments(ctx *Context) State {
 	fs := flag.NewFlagSet("Distributed UNIX Password Cracker Worker", flag.ContinueOnError)
@@ -225,7 +115,7 @@ func handle_arguments(ctx *Context) State {
 		return StateError
 	}
 
-	ctx.WorkerID = newUUIDHexLikePython()
+	ctx.WorkerID = newUUID()
 	fmt.Printf("\nWORKER ID: %s\n", ctx.WorkerID)
 	fmt.Printf("THREADS: %d\n", ctx.Settings.Threads)
 
@@ -320,21 +210,23 @@ func crack(ctx *Context) State {
 	charset := strFromAny(job["charset"])
 	alg_id := strFromAny(job["alg_id"])
 
+	hbInterval := intFromAny(job["hb_interval"])
+	hbDur := time.Duration(hbInterval) * time.Second
+
 	fmt.Printf("\nJOB #%d STARTED\n", intFromAny(job["job_id"]))
 	fmt.Printf("  Cracking password with %d threads...\n", threads)
 
 	startTime := time.Now()
 
-	// control structures
 	jobs := make(chan string, 1<<12)
-	var foundFlag int32 = 0     // 0 = not found, 1 = found/interrupted
-	var totalAttempts int64 = 0 // atomic counter
+	var foundFlag int32 = 0
+	var totalAttempts int64 = 0
 	var wg sync.WaitGroup
 	var foundMu sync.Mutex
 	var foundPassword string
 	statusMessage := "Search Exhausted"
 
-	// helper: verify candidate according to alg_id
+	// Helper: Verify according to algorithm type
 	verifyCandidate := func(candidate string) bool {
 		switch alg_id {
 		case "1":
@@ -354,19 +246,16 @@ func crack(ctx *Context) State {
 		case "y":
 			return verifyYescrypt(candidate, targetHash)
 		default:
-			// unknown algorithm: attempt a best-effort SHA256 (or always false)
 			c := crypt.SHA256.New()
 			return c.Verify(targetHash, []byte(candidate)) == nil
 		}
 	}
 
-	// monitor goroutine: if ctx.InterruptedCrack is set by signal handler, flip foundFlag
+	// Handle manual interruption
 	go func() {
 		for {
 			if ctx.InterruptedCrack {
-				// indicate interruption so generator/workers stop
 				atomic.StoreInt32(&foundFlag, 1)
-				// set status message (thread-safe)
 				foundMu.Lock()
 				statusMessage = "Manually Interrupted"
 				foundMu.Unlock()
@@ -376,7 +265,54 @@ func crack(ctx *Context) State {
 		}
 	}()
 
-	// generator: produce candidates length by length
+	// heartbeat sender: sends heartbeat_resp every hbInterval while cracking
+	// stop by closing hbDone
+	hbDone := make(chan struct{})
+	go func() {
+		// lastReported used to compute delta between heartbeats
+		var lastReported int64 = 0
+		lastTime := time.Now()
+
+		ticker := time.NewTicker(hbDur)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-hbDone:
+				return
+			case <-ticker.C:
+				// Interval stats
+				total := atomic.LoadInt64(&totalAttempts)
+				delta := total - lastReported
+				now := time.Now()
+				elapsed := now.Sub(lastTime).Seconds()
+				rate := 0.0
+				if elapsed > 0 {
+					rate = float64(delta) / elapsed
+				}
+				timestamp := time.Now().Format("15:04:05")
+				hb := map[string]any{
+					"type":           "heartbeat_resp",
+					"delta_tested":   delta,
+					"total_tested":   total,
+					"threads_active": ctx.Settings.Threads,
+					"current_rate":   rate,
+					"timestamp":      timestamp,
+				}
+
+				// best-effort send, ignore error (controller will detect missing pushes)
+				_ = sendMsg(ctx.Controller, hb)
+
+				lastReported = total
+				lastTime = now
+
+				//fmt.Printf("  Sent heartbeat response: delta=%d total=%d rate=%.2f\n", delta, total, rate)
+				fmt.Printf("  Sent heartbeat response (%s)\n", timestamp)
+			}
+		}
+	}()
+
+	// Helper: Produces candidates
 	generator := func() {
 		defer close(jobs)
 
@@ -386,12 +322,11 @@ func crack(ctx *Context) State {
 		}
 
 		for length := 1; ; length++ {
-			// print new-length header
 			fmt.Printf("  Testing passwords of length: %d...\n", length)
 
 			idx := make([]int, length)
 			for {
-				// stop if found or interrupted
+				// Stop if found or interrupted
 				if atomic.LoadInt32(&foundFlag) != 0 {
 					return
 				}
@@ -402,10 +337,9 @@ func crack(ctx *Context) State {
 				}
 				candidate := sb.String()
 
-				// send candidate (block if needed, but wake up if found)
+				// Send candidate
 				select {
 				case jobs <- candidate:
-					// sent
 				default:
 					select {
 					case jobs <- candidate:
@@ -413,12 +347,11 @@ func crack(ctx *Context) State {
 						if atomic.LoadInt32(&foundFlag) != 0 {
 							return
 						}
-						// try a final send (will block until free or found)
 						jobs <- candidate
 					}
 				}
 
-				// advance odometer
+				// Update position
 				pos := length - 1
 				for pos >= 0 {
 					idx[pos]++
@@ -429,34 +362,32 @@ func crack(ctx *Context) State {
 					pos--
 				}
 				if pos < 0 {
-					// exhausted this length
+					// Exhausted this length
 					break
 				}
 			}
 		}
 	}
 
-	// worker: consume candidates and verify
+	// Helper: Worker that consumes candidates and checks if there is a match
 	worker := func(id int) {
 		_ = id
 		defer wg.Done()
 		localAttempts := 0
 
 		for candidate := range jobs {
-			// quit early if found/interrupted
+			// Quit if found or interrupted
 			if atomic.LoadInt32(&foundFlag) != 0 {
 				return
 			}
 
-			// count attempt
+			// Count attempts
 			localAttempts++
 			atomic.AddInt64(&totalAttempts, 1)
 
-			// verify
+			// Check the password and declare if found
 			if verifyCandidate(candidate) {
-				// attempt to announce found (only one worker should succeed here)
 				if atomic.CompareAndSwapInt32(&foundFlag, 0, 1) {
-					// record found password and print summary
 					foundMu.Lock()
 					foundPassword = candidate
 					foundMu.Unlock()
@@ -464,42 +395,43 @@ func crack(ctx *Context) State {
 				return
 			}
 
-			// quick exit if someone else found it meanwhile
+			// Exit if another worker found it
 			if atomic.LoadInt32(&foundFlag) != 0 {
 				return
 			}
 		}
 	}
 
-	// set runtime parallelism to threads (honor provided count)
+	// Limit runtime to the requested amount threads
 	runtime.GOMAXPROCS(threads)
 
-	// start generator
+	// Start generator
 	go generator()
 
-	// spawn workers
+	// Spawn worker threads
 	wg.Add(threads)
 	for t := 0; t < threads; t++ {
 		go worker(t)
 	}
 
-	// wait for workers to finish
+	// Wait for workers to finish
 	wg.Wait()
+
+	// Stop heartbeat sender
+	close(hbDone)
 
 	endTime := time.Now()
 
-	// determine final status
+	// Final status
 	finalFound := ""
 	foundMu.Lock()
 	finalFound = foundPassword
-	// if interrupted but no password, statusMessage was set by monitor goroutine
 	foundMu.Unlock()
 
 	if finalFound != "" {
 		statusMessage = "Success"
 	}
 
-	// fill job result (attempts and compute_time)
 	job["result"] = map[string]any{
 		"found": finalFound != "",
 		"password": func() string {
@@ -513,8 +445,8 @@ func crack(ctx *Context) State {
 		"status":       statusMessage,
 	}
 
-	fmt.Printf("  Cracking process has completed\n")
-	fmt.Printf("  Total Attempts: %d\n", atomic.LoadInt64(&totalAttempts))
+	fmt.Printf("  Cracking process has completed after %d attempts\n", atomic.LoadInt64(&totalAttempts))
+
 	return StateSendResult
 }
 
@@ -568,10 +500,6 @@ func cleanup(ctx *Context) State {
 	return StateCleanup
 }
 
-//
-// ---------------- main ----------------
-//
-
 func main() {
 	fmt.Println("--- WORKER ---")
 
@@ -605,4 +533,101 @@ func main() {
 		ctx.CurrentState = state
 		state = handlers[state](ctx)
 	}
+}
+
+// ---------- Messaging ----------
+
+func sendMsg(conn net.Conn, obj any) error {
+	payload, err := json.Marshal(obj)
+	if err != nil {
+		return err
+	}
+
+	var hdr [4]byte
+	binary.BigEndian.PutUint32(hdr[:], uint32(len(payload)))
+
+	if _, err := conn.Write(hdr[:]); err != nil {
+		return err
+	}
+	_, err = conn.Write(payload)
+	return err
+}
+
+func recvExact(conn net.Conn, n int) ([]byte, error) {
+	buf := make([]byte, n)
+	_, err := io.ReadFull(conn, buf)
+	if err != nil {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return nil, fmt.Errorf("ERROR: Connection closed while reading data")
+		}
+		return nil, err
+	}
+	return buf, nil
+}
+
+func recvMsg(conn net.Conn) (map[string]any, error) {
+	hdr, err := recvExact(conn, 4)
+	if err != nil {
+		return nil, err
+	}
+	n := binary.BigEndian.Uint32(hdr)
+	payload, err := recvExact(conn, int(n))
+	if err != nil {
+		return nil, err
+	}
+
+	var out map[string]any
+	if err := json.Unmarshal(payload, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func recvWithTimeout(conn net.Conn, seconds float64) (map[string]any, error) {
+	_ = conn.SetReadDeadline(time.Now().Add(time.Duration(seconds * float64(time.Second))))
+	msg, err := recvMsg(conn)
+	_ = conn.SetReadDeadline(time.Time{})
+	return msg, err
+}
+
+// ---------- Helpers ----------
+
+func newUUID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func strFromAny(v any) string {
+	s, _ := v.(string)
+	return s
+}
+
+func intFromAny(v any) int {
+	switch x := v.(type) {
+	case float64:
+		return int(x)
+	case int:
+		return x
+	default:
+		return 0
+	}
+}
+
+func verifyYescrypt(candidate, fullHash string) bool {
+	cCand := C.CString(candidate)
+	cSetting := C.CString(fullHash)
+	defer C.free(unsafe.Pointer(cCand))
+	defer C.free(unsafe.Pointer(cSetting))
+
+	var data C.struct_crypt_data
+	data.initialized = 0
+
+	out := C.crypt_r(cCand, cSetting, &data)
+	if out == nil {
+		return false
+	}
+
+	got := C.GoString(out)
+	return subtle.ConstantTimeCompare([]byte(got), []byte(fullHash)) == 1
 }
