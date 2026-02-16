@@ -61,14 +61,13 @@ type Context struct {
 
 	ExitMessage string
 	Controller  net.Conn
-	sendMu      sync.Mutex
 	WorkerID    string
 
 	JobData           map[string]any
 	SendResultLatency *float64
 
-	InterruptedCrack int32
-	CurrentState     int32
+	InterruptedCrack bool
+	CurrentState     State
 }
 
 type Handler func(*Context) State
@@ -255,7 +254,7 @@ func crack(ctx *Context) State {
 	// Handle manual interruption
 	go func() {
 		for {
-			if atomic.LoadInt32(&ctx.InterruptedCrack) == 1 {
+			if ctx.InterruptedCrack {
 				atomic.StoreInt32(&foundFlag, 1)
 				foundMu.Lock()
 				statusMessage = "Manually Interrupted"
@@ -269,10 +268,7 @@ func crack(ctx *Context) State {
 	// heartbeat sender: sends heartbeat_resp every hbInterval while cracking
 	// stop by closing hbDone
 	hbDone := make(chan struct{})
-	var hbWG sync.WaitGroup
-	hbWG.Add(1)
 	go func() {
-		defer hbWG.Done()
 		// lastReported used to compute delta between heartbeats
 		var lastReported int64 = 0
 		lastTime := time.Now()
@@ -304,9 +300,8 @@ func crack(ctx *Context) State {
 					"timestamp":      timestamp,
 				}
 
-				ctx.sendMu.Lock()
+				// best-effort send, ignore error (controller will detect missing pushes)
 				_ = sendMsg(ctx.Controller, hb)
-				ctx.sendMu.Unlock()
 
 				lastReported = total
 				lastTime = now
@@ -424,7 +419,6 @@ func crack(ctx *Context) State {
 
 	// Stop heartbeat sender
 	close(hbDone)
-	hbWG.Wait()
 
 	endTime := time.Now()
 
@@ -432,11 +426,11 @@ func crack(ctx *Context) State {
 	finalFound := ""
 	foundMu.Lock()
 	finalFound = foundPassword
+	foundMu.Unlock()
+
 	if finalFound != "" {
 		statusMessage = "Success"
 	}
-	final_status := statusMessage
-	foundMu.Unlock()
 
 	job["result"] = map[string]any{
 		"found": finalFound != "",
@@ -448,7 +442,7 @@ func crack(ctx *Context) State {
 		}(),
 		"compute_time": endTime.Sub(startTime).Seconds(),
 		"attempts":     int(atomic.LoadInt64(&totalAttempts)),
-		"status":       final_status,
+		"status":       statusMessage,
 	}
 
 	fmt.Printf("  Cracking process has completed after %d attempts\n", atomic.LoadInt64(&totalAttempts))
@@ -470,15 +464,9 @@ func send_result(ctx *Context) State {
 	}
 
 	send_result_start := time.Now()
-	ctx.sendMu.Lock()
 	_ = sendMsg(ctx.Controller, result_msg)
-	ctx.sendMu.Unlock()
 
-	ack, err := recvMsg(ctx.Controller)
-	if err != nil {
-		ctx.ExitMessage = fmt.Sprintf("ERROR: Failed to read result_ack: %v", err)
-		return StateError
-	}
+	ack, _ := recvMsg(ctx.Controller)
 
 	if strFromAny(ack["type"]) != "result_ack" {
 		ctx.ExitMessage = fmt.Sprintf("ERROR: Expected result_ack, got: %v", ack)
@@ -488,11 +476,9 @@ func send_result(ctx *Context) State {
 	lat := time.Since(send_result_start).Seconds()
 	ctx.SendResultLatency = &lat
 
-	ctx.sendMu.Lock()
 	_ = sendMsg(ctx.Controller, map[string]any{
 		"result_return_latency": lat,
 	})
-	ctx.sendMu.Unlock()
 
 	fmt.Printf("\nRESULT SENT TO CONTROLLER\n")
 	fmt.Printf("  Result Return Latency: %.2f milliseconds (W -> C)\n", lat*1000)
@@ -535,8 +521,8 @@ func main() {
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		if atomic.LoadInt32(&ctx.CurrentState) == int32(StateCrack) {
-			atomic.StoreInt32(&ctx.InterruptedCrack, 1)
+		if ctx.CurrentState == StateCrack {
+			ctx.InterruptedCrack = true
 			return
 		}
 		handlers[StateCleanup](ctx)
@@ -544,7 +530,7 @@ func main() {
 
 	state := StateParseArgs
 	for {
-		atomic.StoreInt32(&ctx.CurrentState, int32(state))
+		ctx.CurrentState = state
 		state = handlers[state](ctx)
 	}
 }
