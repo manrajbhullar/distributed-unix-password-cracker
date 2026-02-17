@@ -204,7 +204,7 @@ func receive_job(ctx *Context) State {
 }
 
 func crack(ctx *Context) State {
-	time.Sleep(10 * time.Second) // Test HB Protocol
+	//time.Sleep(10 * time.Second) // Test HB Protocol
 
 	job := ctx.JobData
 	threads := ctx.Settings.Threads

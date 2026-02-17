@@ -26,6 +26,7 @@ const (
 	StateReceiveRegistration
 	StateDispatchJob
 	StateWaitResult
+	StateReportResults
 	StateCleanup
 	StateError
 )
@@ -67,6 +68,8 @@ type Context struct {
 
 	DispatchLatency     *float64
 	ResultReturnLatency *float64
+
+	FinalResult map[string]any
 }
 
 type Handler func(*Context) State
@@ -378,118 +381,140 @@ func wait_result(ctx *Context) State {
 	timeout := heartbeatDur + grace
 
 	for {
-		// Wait for a message (heartbeat or final result)
 		msg, err := recvWithTimeout(ctx.WorkerConn, timeout)
 		if err != nil {
-			// Timeout in current interval
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				missed++
 				if missed > maxMisses {
-					ctx.ExitMessage = fmt.Sprintf("ERROR: Worker unresponsive (no message for %d seconds)", heartbeatSec*(missed))
+					ctx.ExitMessage = fmt.Sprintf(
+						"ERROR: Worker unresponsive (no message for %d seconds)",
+						heartbeatSec*missed,
+					)
 					return StateError
 				}
-				fmt.Printf("\nHEARTBEAT MISS: No response from worker in last %d sec (miss %d). Waiting again...\n", heartbeatSec, missed)
+
+				fmt.Printf(
+					"\nHEARTBEAT MISS: No response from worker in last %d sec (miss %d). Waiting again...\n",
+					heartbeatSec,
+					missed,
+				)
 				continue
 			}
-			// Error
+
 			ctx.ExitMessage = "ERROR: Failed to receive message from worker"
 			return StateError
 		}
 
-		// Got message
 		missed = 0
-
 		typ := strFromAny(msg["type"])
 
-		// Final result
 		if typ == "result" {
 			_ = sendMsg(ctx.WorkerConn, map[string]any{"type": "result_ack"})
+
 			latMsg, err := recvMsg(ctx.WorkerConn)
 			if err != nil {
-				ctx.ExitMessage = fmt.Sprintf("ERROR: Failed to receive result latency message. %v", err)
+				ctx.ExitMessage = fmt.Sprintf(
+					"ERROR: Failed to receive result latency message. %v",
+					err,
+				)
 				return StateError
 			}
+
 			rrl := floatFromAny(latMsg["result_return_latency"])
 			ctx.ResultReturnLatency = &rrl
 
-			result := msg
-
-			fmt.Println("\n" + strings.Repeat("=", 40))
-			fmt.Println("            CRACKING RESULTS")
-			fmt.Println(strings.Repeat("=", 40))
-
-			found := boolFromAny(result["found"])
-			var statusValue string
-			var passwordValue string
-			if found {
-				statusValue = "SUCCESS"
-				passwordValue, _ = result["password"].(string)
-			} else {
-				statusValue = "FAILED"
-				passwordValue = "N/A"
-			}
-
-			attempts := floatFromAny(result["attempts"])
-			crackTime := floatFromAny(result["compute_time"])
-
-			hps := 0.0
-			if crackTime > 0 {
-				hps = attempts / crackTime
-			}
+			// Store final result for report state
+			ctx.FinalResult = msg
 
 			end := time.Now()
 			ctx.RuntimeEnd = &end
 			runtime := end.Sub(*ctx.RuntimeStart).Seconds()
 			ctx.Runtime = &runtime
 
-			labelWidth := 20
-			fmt.Printf("%-*s %s\n", labelWidth, "STATUS:", statusValue)
-			fmt.Printf("%-*s %s\n", labelWidth, "PASSWORD:", passwordValue)
-			fmt.Printf("%-*s %.0f\n", labelWidth, "ATTEMPTS:", attempts)
-			fmt.Printf("%-*s %.2f seconds\n", labelWidth, "TIME:", crackTime)
-			fmt.Printf("%-*s %.2f hashes/sec\n", labelWidth, "SPEED:", hps)
-
-			parseMs := 0.0
-			if ctx.ParseTime != nil {
-				parseMs = (*ctx.ParseTime) * 1000
-			}
-			dispatchMs := 0.0
-			if ctx.DispatchLatency != nil {
-				dispatchMs = (*ctx.DispatchLatency) * 1000
-			}
-			resultMs := 0.0
-			if ctx.ResultReturnLatency != nil {
-				resultMs = (*ctx.ResultReturnLatency) * 1000
-			}
-
-			fmt.Printf("%-*s %.2f milliseconds\n", labelWidth, "PARSING TIME:", parseMs)
-			fmt.Printf("%-*s %.2f milliseconds\n", labelWidth, "DISPATCH LATENCY:", dispatchMs)
-			fmt.Printf("%-*s %.2f milliseconds\n", labelWidth, "RESULT LATENCY:", resultMs)
-			fmt.Printf("%-*s %.2f seconds\n", labelWidth, "E2E RUNTIME:", runtime)
-			fmt.Println(strings.Repeat("=", 40))
-
-			return StateCleanup
+			return StateReportResults
 		}
 
-		// heartbeat push from worker (push-based)
 		if typ == "heartbeat_resp" {
 			delta := floatFromAny(msg["delta_tested"])
 			total := floatFromAny(msg["total_tested"])
 			threadsActive := intFromAny(msg["threads_active"])
 			rate := floatFromAny(msg["current_rate"])
+
 			fmt.Printf("\nHEARTBEAT (every %d sec)\n", heartbeatSec)
 			fmt.Printf("  Delta Tested: %.0f\n", delta)
 			fmt.Printf("  Total Attempts: %.0f\n", total)
 			fmt.Printf("  Threads Active: %d\n", threadsActive)
-			fmt.Printf("  Current Rate): %.2f hashes/sec\n", rate)
+			fmt.Printf("  Current Rate: %.2f hashes/sec\n", rate)
 
-			// keep waiting for next message (worker will push again after interval)
 			continue
 		}
 
-		// unexpected message: log and continue
-		fmt.Printf("  Received unexpected message while waiting")
+		fmt.Println("  Received unexpected message while waiting")
 	}
+}
+
+func report_results(ctx *Context) State {
+	result := ctx.FinalResult
+	if result == nil {
+		ctx.ExitMessage = "ERROR: No final result to report"
+		return StateError
+	}
+
+	fmt.Println("\n" + strings.Repeat("=", 40))
+	fmt.Println("            CRACKING RESULTS")
+	fmt.Println(strings.Repeat("=", 40))
+
+	found := boolFromAny(result["found"])
+	var statusValue string
+	var passwordValue string
+	if found {
+		statusValue = "SUCCESS"
+		passwordValue, _ = result["password"].(string)
+	} else {
+		statusValue = "FAILED"
+		passwordValue = "N/A"
+	}
+
+	attempts := floatFromAny(result["attempts"])
+	crackTime := floatFromAny(result["compute_time"])
+
+	hps := 0.0
+	if crackTime > 0 {
+		hps = attempts / crackTime
+	}
+
+	labelWidth := 20
+	fmt.Printf("%-*s %s\n", labelWidth, "STATUS:", statusValue)
+	fmt.Printf("%-*s %s\n", labelWidth, "PASSWORD:", passwordValue)
+	fmt.Printf("%-*s %.0f\n", labelWidth, "ATTEMPTS:", attempts)
+	fmt.Printf("%-*s %.2f seconds\n", labelWidth, "TIME:", crackTime)
+	fmt.Printf("%-*s %.2f hashes/sec\n", labelWidth, "SPEED:", hps)
+
+	parseMs := 0.0
+	if ctx.ParseTime != nil {
+		parseMs = (*ctx.ParseTime) * 1000
+	}
+	dispatchMs := 0.0
+	if ctx.DispatchLatency != nil {
+		dispatchMs = (*ctx.DispatchLatency) * 1000
+	}
+	resultMs := 0.0
+	if ctx.ResultReturnLatency != nil {
+		resultMs = (*ctx.ResultReturnLatency) * 1000
+	}
+
+	runtime := 0.0
+	if ctx.Runtime != nil {
+		runtime = *ctx.Runtime
+	}
+
+	fmt.Printf("%-*s %.2f milliseconds\n", labelWidth, "PARSING TIME:", parseMs)
+	fmt.Printf("%-*s %.2f milliseconds\n", labelWidth, "DISPATCH LATENCY:", dispatchMs)
+	fmt.Printf("%-*s %.2f milliseconds\n", labelWidth, "RESULT LATENCY:", resultMs)
+	fmt.Printf("%-*s %.2f seconds\n", labelWidth, "E2E RUNTIME:", runtime)
+	fmt.Println(strings.Repeat("=", 40))
+
+	return StateCleanup
 }
 
 func state_error(ctx *Context) State {
@@ -526,6 +551,7 @@ func main() {
 		StateReceiveRegistration: receive_registration,
 		StateDispatchJob:         dispatch_job,
 		StateWaitResult:          wait_result,
+		StateReportResults:       report_results,
 		StateError:               state_error,
 		StateCleanup:             cleanup,
 	}
