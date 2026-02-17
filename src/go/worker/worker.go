@@ -305,8 +305,12 @@ func crack(ctx *Context) State {
 				}
 
 				ctx.sendMu.Lock()
-				_ = sendMsg(ctx.Controller, hb)
+				err := sendMsg(ctx.Controller, hb)
 				ctx.sendMu.Unlock()
+				if err != nil {
+					fmt.Printf("  Connection to controller lost. Continuing cracking...\n")
+					return
+				}
 
 				lastReported = total
 				lastTime = now
@@ -476,7 +480,7 @@ func send_result(ctx *Context) State {
 
 	ack, err := recvMsg(ctx.Controller)
 	if err != nil {
-		ctx.ExitMessage = fmt.Sprintf("ERROR: Failed to read result_ack: %v", err)
+		ctx.ExitMessage = "ERROR: Failed to send results to controller"
 		return StateError
 	}
 
