@@ -46,8 +46,8 @@ const (
 	StateWaitJob
 	StateCrack
 	StateSendResult
-	StateCleanup
 	StateError
+	StateCleanup
 )
 
 type Settings struct {

@@ -27,8 +27,8 @@ const (
 	StateDispatchJob
 	StateWaitResult
 	StateReportResults
-	StateCleanup
 	StateError
+	StateCleanup
 )
 
 type Settings struct {
