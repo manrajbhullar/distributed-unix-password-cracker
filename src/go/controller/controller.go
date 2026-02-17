@@ -71,7 +71,7 @@ type Context struct {
 
 type Handler func(*Context) State
 
-func parseArguments(ctx *Context) State {
+func parse_arguments(ctx *Context) State {
 	fs := flag.NewFlagSet("Distributed UNIX Password Cracker Controller", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 
@@ -105,7 +105,7 @@ func parseArguments(ctx *Context) State {
 	return StateHandleArgs
 }
 
-func handleArguments(ctx *Context) State {
+func handle_arguments(ctx *Context) State {
 	port := ctx.Settings.Port
 	if port < 1024 || port > 65535 {
 		ctx.ExitMessage = "ERROR: Port must be between 1024 and 65535"
@@ -136,7 +136,7 @@ func handleArguments(ctx *Context) State {
 	return StateParseShadow
 }
 
-func parseShadow(ctx *Context) State {
+func parse_shadow(ctx *Context) State {
 	username := ctx.Settings.Username
 	filename := ctx.Settings.Filename
 
@@ -255,7 +255,7 @@ func listen(ctx *Context) State {
 	return StateWaitRegister
 }
 
-func acceptWorker(ctx *Context) State {
+func accept_worker(ctx *Context) State {
 	if ctx.ServerLn == nil {
 		ctx.ExitMessage = "ERROR: Control server failed to start."
 		return StateError
@@ -274,7 +274,7 @@ func acceptWorker(ctx *Context) State {
 	return StateReceiveRegistration
 }
 
-func receiveRegistration(ctx *Context) State {
+func receive_registration(ctx *Context) State {
 	if ctx.WorkerConn == nil {
 		ctx.ExitMessage = "ERROR: No worker socket"
 		return StateError
@@ -306,7 +306,7 @@ func receiveRegistration(ctx *Context) State {
 	return StateDispatchJob
 }
 
-func dispatchJob(ctx *Context) State {
+func dispatch_job(ctx *Context) State {
 	now := time.Now()
 	ctx.RuntimeStart = &now
 
@@ -360,7 +360,7 @@ func dispatchJob(ctx *Context) State {
 	return StateWaitResult
 }
 
-func waitResult(ctx *Context) State {
+func wait_result(ctx *Context) State {
 	fmt.Println("  Waiting for worker to finish cracking...")
 
 	if ctx.WorkerConn == nil {
@@ -372,11 +372,14 @@ func waitResult(ctx *Context) State {
 	heartbeatDur := time.Duration(heartbeatSec) * time.Second
 
 	missed := 0
-	maxMisses := 1
+	maxMisses := 2
+
+	grace := 500 * time.Millisecond
+	timeout := heartbeatDur + grace
 
 	for {
 		// Wait for a message (heartbeat or final result)
-		msg, err := recvWithTimeout(ctx.WorkerConn, heartbeatDur)
+		msg, err := recvWithTimeout(ctx.WorkerConn, timeout)
 		if err != nil {
 			// Timeout in current interval
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
@@ -385,11 +388,11 @@ func waitResult(ctx *Context) State {
 					ctx.ExitMessage = fmt.Sprintf("ERROR: Worker unresponsive (no message for %d seconds)", heartbeatSec*(missed))
 					return StateError
 				}
-				fmt.Printf("  No message from worker in last %d sec (miss %d). Waiting again.\n", heartbeatSec, missed)
+				fmt.Printf("\nHEARTBEAT MISS: No response from worker in last %d sec (miss %d). Waiting again...\n", heartbeatSec, missed)
 				continue
 			}
 			// Error
-			ctx.ExitMessage = fmt.Sprintf("ERROR: Failed to receive message from worker. %v", err)
+			ctx.ExitMessage = "ERROR: Failed to receive message from worker"
 			return StateError
 		}
 
@@ -489,7 +492,7 @@ func waitResult(ctx *Context) State {
 	}
 }
 
-func controllerError(ctx *Context) State {
+func state_error(ctx *Context) State {
 	fmt.Printf("\n%s\n", ctx.ExitMessage)
 	return StateCleanup
 }
@@ -515,15 +518,15 @@ func main() {
 	}
 
 	handlers := map[State]Handler{
-		StateParseArgs:           parseArguments,
-		StateHandleArgs:          handleArguments,
-		StateParseShadow:         parseShadow,
+		StateParseArgs:           parse_arguments,
+		StateHandleArgs:          handle_arguments,
+		StateParseShadow:         parse_shadow,
 		StateListen:              listen,
-		StateWaitRegister:        acceptWorker,
-		StateReceiveRegistration: receiveRegistration,
-		StateDispatchJob:         dispatchJob,
-		StateWaitResult:          waitResult,
-		StateError:               controllerError,
+		StateWaitRegister:        accept_worker,
+		StateReceiveRegistration: receive_registration,
+		StateDispatchJob:         dispatch_job,
+		StateWaitResult:          wait_result,
+		StateError:               state_error,
 		StateCleanup:             cleanup,
 	}
 

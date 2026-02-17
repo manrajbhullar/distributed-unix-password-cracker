@@ -204,6 +204,8 @@ func receive_job(ctx *Context) State {
 }
 
 func crack(ctx *Context) State {
+	time.Sleep(10 * time.Second) // Test HB Protocol
+
 	job := ctx.JobData
 	threads := ctx.Settings.Threads
 
@@ -227,7 +229,118 @@ func crack(ctx *Context) State {
 	var foundPassword string
 	statusMessage := "Search Exhausted"
 
-	// Helper: Verify according to algorithm type
+	// Handle manual interruption
+	go func() {
+		for {
+			if atomic.LoadInt32(&ctx.InterruptedCrack) == 1 {
+				atomic.StoreInt32(&foundFlag, 1)
+				foundMu.Lock()
+				statusMessage = "Manually Interrupted"
+				foundMu.Unlock()
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}()
+
+	// Handles heartbeats
+	hbDone := make(chan struct{})
+	var hbWG sync.WaitGroup
+	hbWG.Add(1)
+	go func() {
+		defer hbWG.Done()
+		var lastReported int64 = 0
+		lastTime := time.Now()
+		ticker := time.NewTicker(hbDur)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-hbDone:
+				return
+			case <-ticker.C:
+				total := atomic.LoadInt64(&totalAttempts)
+				delta := total - lastReported
+				now := time.Now()
+				elapsed := now.Sub(lastTime).Seconds()
+				rate := 0.0
+				if elapsed > 0 {
+					rate = float64(delta) / elapsed
+				}
+				timestamp := time.Now().Format("15:04:05")
+				hb := map[string]any{
+					"type":           "heartbeat_resp",
+					"delta_tested":   delta,
+					"total_tested":   total,
+					"threads_active": ctx.Settings.Threads,
+					"current_rate":   rate,
+					"timestamp":      timestamp,
+				}
+				ctx.sendMu.Lock()
+				err := sendMsg(ctx.Controller, hb)
+				ctx.sendMu.Unlock()
+				if err != nil {
+					fmt.Printf("  Connection to controller lost. Continuing cracking...\n")
+					return
+				}
+				lastReported = total
+				lastTime = now
+				fmt.Printf("  Sent heartbeat response (%s)\n", timestamp)
+			}
+		}
+	}()
+
+	// Candidate generator
+	generator := func() {
+		defer close(jobs)
+		base := len(charset)
+		if base == 0 {
+			return
+		}
+		for length := 1; ; length++ {
+			fmt.Printf("  Testing passwords of length: %d...\n", length)
+			idx := make([]int, length)
+			for {
+				// Stop if found or interrupted
+				if atomic.LoadInt32(&foundFlag) != 0 {
+					return
+				}
+				var sb strings.Builder
+				for i := 0; i < length; i++ {
+					sb.WriteByte(charset[idx[i]])
+				}
+				candidate := sb.String()
+				// Send candidate
+				select {
+				case jobs <- candidate:
+				default:
+					select {
+					case jobs <- candidate:
+					case <-time.After(10 * time.Millisecond):
+						if atomic.LoadInt32(&foundFlag) != 0 {
+							return
+						}
+						jobs <- candidate
+					}
+				}
+				// Update position
+				pos := length - 1
+				for pos >= 0 {
+					idx[pos]++
+					if idx[pos] < base {
+						break
+					}
+					idx[pos] = 0
+					pos--
+				}
+				if pos < 0 {
+					// Exhausted this length
+					break
+				}
+			}
+		}
+	}
+
+	// Verifies according to algorithm type
 	verifyCandidate := func(candidate string) bool {
 		switch alg_id {
 		case "1":
@@ -252,148 +365,19 @@ func crack(ctx *Context) State {
 		}
 	}
 
-	// Handle manual interruption
-	go func() {
-		for {
-			if atomic.LoadInt32(&ctx.InterruptedCrack) == 1 {
-				atomic.StoreInt32(&foundFlag, 1)
-				foundMu.Lock()
-				statusMessage = "Manually Interrupted"
-				foundMu.Unlock()
-				return
-			}
-			time.Sleep(50 * time.Millisecond)
-		}
-	}()
-
-	// heartbeat sender: sends heartbeat_resp every hbInterval while cracking
-	// stop by closing hbDone
-	hbDone := make(chan struct{})
-	var hbWG sync.WaitGroup
-	hbWG.Add(1)
-	go func() {
-		defer hbWG.Done()
-		// lastReported used to compute delta between heartbeats
-		var lastReported int64 = 0
-		lastTime := time.Now()
-
-		ticker := time.NewTicker(hbDur)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-hbDone:
-				return
-			case <-ticker.C:
-				// Interval stats
-				total := atomic.LoadInt64(&totalAttempts)
-				delta := total - lastReported
-				now := time.Now()
-				elapsed := now.Sub(lastTime).Seconds()
-				rate := 0.0
-				if elapsed > 0 {
-					rate = float64(delta) / elapsed
-				}
-				timestamp := time.Now().Format("15:04:05")
-				hb := map[string]any{
-					"type":           "heartbeat_resp",
-					"delta_tested":   delta,
-					"total_tested":   total,
-					"threads_active": ctx.Settings.Threads,
-					"current_rate":   rate,
-					"timestamp":      timestamp,
-				}
-
-				ctx.sendMu.Lock()
-				err := sendMsg(ctx.Controller, hb)
-				ctx.sendMu.Unlock()
-				if err != nil {
-					fmt.Printf("  Connection to controller lost. Continuing cracking...\n")
-					return
-				}
-
-				lastReported = total
-				lastTime = now
-
-				//fmt.Printf("  Sent heartbeat response: delta=%d total=%d rate=%.2f\n", delta, total, rate)
-				fmt.Printf("  Sent heartbeat response (%s)\n", timestamp)
-			}
-		}
-	}()
-
-	// Helper: Produces candidates
-	generator := func() {
-		defer close(jobs)
-
-		base := len(charset)
-		if base == 0 {
-			return
-		}
-
-		for length := 1; ; length++ {
-			fmt.Printf("  Testing passwords of length: %d...\n", length)
-
-			idx := make([]int, length)
-			for {
-				// Stop if found or interrupted
-				if atomic.LoadInt32(&foundFlag) != 0 {
-					return
-				}
-
-				var sb strings.Builder
-				for i := 0; i < length; i++ {
-					sb.WriteByte(charset[idx[i]])
-				}
-				candidate := sb.String()
-
-				// Send candidate
-				select {
-				case jobs <- candidate:
-				default:
-					select {
-					case jobs <- candidate:
-					case <-time.After(10 * time.Millisecond):
-						if atomic.LoadInt32(&foundFlag) != 0 {
-							return
-						}
-						jobs <- candidate
-					}
-				}
-
-				// Update position
-				pos := length - 1
-				for pos >= 0 {
-					idx[pos]++
-					if idx[pos] < base {
-						break
-					}
-					idx[pos] = 0
-					pos--
-				}
-				if pos < 0 {
-					// Exhausted this length
-					break
-				}
-			}
-		}
-	}
-
-	// Helper: Worker that consumes candidates and checks if there is a match
+	// Consumes candidates and checks if there is a match
 	worker := func(id int) {
 		_ = id
 		defer wg.Done()
 		localAttempts := 0
-
 		for candidate := range jobs {
 			// Quit if found or interrupted
 			if atomic.LoadInt32(&foundFlag) != 0 {
 				return
 			}
-
 			// Count attempts
 			localAttempts++
 			atomic.AddInt64(&totalAttempts, 1)
-
 			// Check the password and declare if found
 			if verifyCandidate(candidate) {
 				if atomic.CompareAndSwapInt32(&foundFlag, 0, 1) {
@@ -403,7 +387,6 @@ func crack(ctx *Context) State {
 				}
 				return
 			}
-
 			// Exit if another worker found it
 			if atomic.LoadInt32(&foundFlag) != 0 {
 				return
@@ -411,26 +394,18 @@ func crack(ctx *Context) State {
 		}
 	}
 
-	// Limit runtime to the requested amount threads
-	runtime.GOMAXPROCS(threads)
-
-	// Start generator
-	go generator()
-
+	runtime.GOMAXPROCS(threads) // Limit Go runtime to the requested amount OS threads
+	go generator()              // Start generator
 	// Spawn worker threads
 	wg.Add(threads)
-	for t := 0; t < threads; t++ {
-		go worker(t)
+	for i := 0; i < threads; i++ {
+		go worker(i)
 	}
+	wg.Wait()     // Wait for workers to finish
+	close(hbDone) // Stop heartbeats
+	hbWG.Wait()   // Wait for heartbeat routine to exit
 
-	// Wait for workers to finish
-	wg.Wait()
-
-	// Stop heartbeat sender
-	close(hbDone)
-	hbWG.Wait()
-
-	endTime := time.Now()
+	endTime := time.Now() // End cracking timer
 
 	// Final status
 	finalFound := ""
@@ -501,6 +476,7 @@ func send_result(ctx *Context) State {
 	fmt.Printf("\nRESULT SENT TO CONTROLLER\n")
 	fmt.Printf("  Result Return Latency: %.2f milliseconds (W -> C)\n", lat*1000)
 	fmt.Printf("\nJOB #1 COMPLETE\n")
+
 	return StateCleanup
 }
 
