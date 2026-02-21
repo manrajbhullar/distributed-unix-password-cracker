@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 USERNAME="manraj"
-PASSWORD="aZ1"
+PASSWORD="Ml5"
 OUT="shadow"
 
 # Cost Settings
@@ -22,7 +22,7 @@ YESCRYPT=$(pw | mkpasswd --method=yescrypt --rounds="$YESCRYPT_ROUNDS" -s)
 echo "${USERNAME}_yescrypt:${YESCRYPT}:19000:0:99999:7:::" >> "$OUT"
 
 # ---------- bcrypt ----------
-BCRYPT=$(htpasswd -bnBC "$BCRYPT_COST" "" "$PASSWORD" | tr -d ':\n')
+BCRYPT=$(pw | mkpasswd --method=bcrypt --rounds="$BCRYPT_COST" -s)
 echo "${USERNAME}_bcrypt:${BCRYPT}:19000:0:99999:7:::" >> "$OUT"
 
 # ---------- sha256 ----------
