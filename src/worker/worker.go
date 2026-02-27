@@ -19,7 +19,6 @@ import (
 	"os/signal"
 	"runtime"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -43,7 +42,8 @@ const (
 	StateRegister
 	StateRequestJob
 	StateCrack
-	StateSendResult
+	StateSendJobResult
+	StateStopWorker
 	StateError
 	StateCleanup
 )
@@ -66,6 +66,7 @@ type Context struct {
 	SendResultLatency *float64
 
 	InterruptedCrack int32
+	ForceStop        int32
 	CurrentState     int32
 }
 
@@ -169,7 +170,7 @@ func register(ctx *Context) State {
 }
 
 func request_job(ctx *Context) State {
-	fmt.Printf("\nWORKER READY\n")
+	fmt.Printf("\nREADY FOR JOB\n")
 	fmt.Println("  Requesting job from controller...")
 
 	req := map[string]any{
@@ -185,6 +186,10 @@ func request_job(ctx *Context) State {
 	if err != nil {
 		ctx.ExitMessage = fmt.Sprintf("ERROR: Receiving job failed. %v", err)
 		return StateError
+	}
+
+	if strFromAny(job["type"]) == "stop" {
+		return StateStopWorker
 	}
 
 	ack := map[string]any{
@@ -221,8 +226,11 @@ func crack(ctx *Context) State {
 	hbInterval := intFromAny(job["hb_interval"])
 	hbDur := time.Duration(hbInterval) * time.Second
 
+	chunkStart := int64FromAny(job["chunk_start"])
+	chunkEnd := chunkStart + int64(intFromAny(job["chunk_size"]))
+
 	fmt.Printf("\nJOB #%d STARTED\n", intFromAny(job["job_id"]))
-	fmt.Printf("  Cracking password with %d threads...\n", threads)
+	fmt.Printf("  Cracking passwords %d to %d in this chunk with %d threads...\n", chunkStart, chunkEnd, threads)
 
 	startTime := time.Now()
 
@@ -289,57 +297,56 @@ func crack(ctx *Context) State {
 				}
 				lastReported = total
 				lastTime = now
-				fmt.Printf("  Sent heartbeat response (WorkerID: %s) (%s)\n", ctx.WorkerID, timestamp)
+				fmt.Printf("  Sent heartbeat response (%s)\n", timestamp)
 			}
 		}
 	}()
 
-	// Candidate generator
-	generator := func() {
-		defer close(jobs)
-		base := len(charset)
-		if base == 0 {
+	// Force stop listener — controller pushes this when another worker finds the password
+	fsStopCh := make(chan struct{})
+	var fsWG sync.WaitGroup
+	fsWG.Add(1)
+	go func() {
+		defer fsWG.Done()
+		for {
+			_ = ctx.Controller.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
+			msg, err := recvMsg(ctx.Controller)
+			if err != nil {
+				select {
+				case <-fsStopCh:
+					_ = ctx.Controller.SetReadDeadline(time.Time{})
+					return
+				default:
+					continue
+				}
+			}
+			_ = ctx.Controller.SetReadDeadline(time.Time{})
+			if strFromAny(msg["type"]) == "force_stop" {
+				atomic.StoreInt32(&ctx.ForceStop, 1)
+				atomic.StoreInt32(&foundFlag, 1)
+			}
 			return
 		}
-		for length := 1; ; length++ {
-			fmt.Printf("  Testing passwords of length: %d...\n", length)
-			idx := make([]int, length)
-			for {
-				// Stop if found or interrupted
-				if atomic.LoadInt32(&foundFlag) != 0 {
-					return
-				}
-				var sb strings.Builder
-				for i := 0; i < length; i++ {
-					sb.WriteByte(charset[idx[i]])
-				}
-				candidate := sb.String()
-				// Send candidate
+	}()
+
+	// Candidate generator — bounded to the assigned chunk
+	generator := func() {
+		defer close(jobs)
+		for i := chunkStart; i < chunkEnd; i++ {
+			if atomic.LoadInt32(&foundFlag) != 0 {
+				return
+			}
+			candidate := indexToCandidate(i, charset)
+			select {
+			case jobs <- candidate:
+			default:
 				select {
 				case jobs <- candidate:
-				default:
-					select {
-					case jobs <- candidate:
-					case <-time.After(10 * time.Millisecond):
-						if atomic.LoadInt32(&foundFlag) != 0 {
-							return
-						}
-						jobs <- candidate
+				case <-time.After(10 * time.Millisecond):
+					if atomic.LoadInt32(&foundFlag) != 0 {
+						return
 					}
-				}
-				// Update position
-				pos := length - 1
-				for pos >= 0 {
-					idx[pos]++
-					if idx[pos] < base {
-						break
-					}
-					idx[pos] = 0
-					pos--
-				}
-				if pos < 0 {
-					// Exhausted this length
-					break
+					jobs <- candidate
 				}
 			}
 		}
@@ -406,9 +413,11 @@ func crack(ctx *Context) State {
 	for i := 0; i < threads; i++ {
 		go worker(i)
 	}
-	wg.Wait()     // Wait for workers to finish
-	close(hbDone) // Stop heartbeats
-	hbWG.Wait()   // Wait for heartbeat routine to exit
+	wg.Wait()        // Wait for workers to finish
+	close(hbDone)    // Stop heartbeats
+	hbWG.Wait()      // Wait for heartbeat routine to exit
+	close(fsStopCh)  // Stop force stop listener
+	fsWG.Wait()      // Wait for force stop listener to exit
 
 	endTime := time.Now() // End cracking timer
 
@@ -435,13 +444,19 @@ func crack(ctx *Context) State {
 		"status":       final_status,
 	}
 
-	fmt.Printf("  Cracking process has completed after %d attempts\n", atomic.LoadInt64(&totalAttempts))
+	fmt.Printf("  Cracking has completed for this chunk after %d attempts\n", atomic.LoadInt64(&totalAttempts))
 
-	return StateSendResult
+	if atomic.LoadInt32(&ctx.ForceStop) == 1 {
+		fmt.Printf("\nSTOP: PASSWORD FOUND\n")
+		return StateCleanup
+	}
+
+	return StateSendJobResult
 }
 
-func send_result(ctx *Context) State {
+func send_job_result(ctx *Context) State {
 	result := ctx.JobData["result"].(map[string]any)
+	found, _ := result["found"].(bool)
 
 	result_msg := map[string]any{
 		"type":         "result",
@@ -478,18 +493,36 @@ func send_result(ctx *Context) State {
 	})
 	ctx.sendMu.Unlock()
 
-	fmt.Printf("\nRESULT SENT TO CONTROLLER\n")
+	fmt.Printf("\nJOB #%d RESULT SENT\n", intFromAny(ctx.JobData["job_id"]))
+	fmt.Printf("  Status: %s\n", strFromAny(result["status"]))
+	if found {
+		fmt.Printf("  Password: %s\n", strFromAny(result["password"]))
+	}
 	fmt.Printf("  Result Return Latency: %.2f milliseconds (W -> C)\n", lat*1000)
-	fmt.Printf("\nJOB #%d COMPLETE\n", intFromAny(ctx.JobData["job_id"]))
 
-	// Notify controller we are disconnecting
+	if found || atomic.LoadInt32(&ctx.InterruptedCrack) == 1 {
+		// Password found or user interrupted — notify controller and exit
+		ctx.sendMu.Lock()
+		_ = sendMsg(ctx.Controller, map[string]any{
+			"type":      "disconnect",
+			"worker_id": ctx.WorkerID,
+		})
+		ctx.sendMu.Unlock()
+		return StateCleanup
+	}
+
+	// Chunk exhausted but not found — request another chunk
+	return StateRequestJob
+}
+
+func stop_worker(ctx *Context) State {
+	fmt.Printf("\nSTOP RECEIVED (WorkerID: %s) - password found by another worker\n", ctx.WorkerID)
 	ctx.sendMu.Lock()
 	_ = sendMsg(ctx.Controller, map[string]any{
 		"type":      "disconnect",
 		"worker_id": ctx.WorkerID,
 	})
 	ctx.sendMu.Unlock()
-
 	return StateCleanup
 }
 
@@ -513,15 +546,16 @@ func main() {
 	ctx := &Context{}
 
 	handlers := map[State]Handler{
-		StateParseArgs:  parse_arguments,
-		StateHandleArgs: handle_arguments,
-		StateConnect:    connect,
-		StateRegister:   register,
+		StateParseArgs:     parse_arguments,
+		StateHandleArgs:    handle_arguments,
+		StateConnect:       connect,
+		StateRegister:      register,
 		StateRequestJob:    request_job,
-		StateCrack:      crack,
-		StateSendResult: send_result,
-		StateError:      error_state,
-		StateCleanup:    cleanup,
+		StateCrack:         crack,
+		StateSendJobResult: send_job_result,
+		StateStopWorker:    stop_worker,
+		StateError:         error_state,
+		StateCleanup:       cleanup,
 	}
 
 	sigCh := make(chan os.Signal, 1)
@@ -613,6 +647,38 @@ func intFromAny(v any) int {
 	default:
 		return 0
 	}
+}
+
+func int64FromAny(v any) int64 {
+	switch x := v.(type) {
+	case float64:
+		return int64(x)
+	case int64:
+		return x
+	case int:
+		return int64(x)
+	default:
+		return 0
+	}
+}
+
+// indexToCandidate converts a flat global index into a password string.
+// The index space is: 0..(base-1) for length-1, base..(base+base²-1) for length-2, etc.
+func indexToCandidate(index int64, charset string) string {
+	base := int64(len(charset))
+	length := 1
+	count := base
+	for index >= count {
+		index -= count
+		length++
+		count *= base
+	}
+	result := make([]byte, length)
+	for i := length - 1; i >= 0; i-- {
+		result[i] = charset[index%base]
+		index /= base
+	}
+	return string(result)
 }
 
 func verifyYescrypt(candidate, fullHash string) bool {
