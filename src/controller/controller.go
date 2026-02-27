@@ -217,12 +217,23 @@ func parse_shadow(ctx *Context) State {
 			ctx.PwInfo.Hash = combined[22:]
 
 		} else {
-			if len(tokens) < 5 {
-				ctx.ExitMessage = "ERROR: User hash failed to tokenize"
-				return StateError
+			// sha256/sha512: either $5$rounds=N$salt$hash (5 tokens)
+			// or $5$salt$hash (4 tokens, default rounds)
+			if strings.HasPrefix(tokens[2], "rounds=") {
+				if len(tokens) < 5 {
+					ctx.ExitMessage = "ERROR: User hash failed to tokenize"
+					return StateError
+				}
+				ctx.PwInfo.Salt = tokens[3]
+				ctx.PwInfo.Hash = tokens[4]
+			} else {
+				if len(tokens) < 4 {
+					ctx.ExitMessage = "ERROR: User hash failed to tokenize"
+					return StateError
+				}
+				ctx.PwInfo.Salt = tokens[2]
+				ctx.PwInfo.Hash = tokens[3]
 			}
-			ctx.PwInfo.Salt = tokens[3]
-			ctx.PwInfo.Hash = tokens[4]
 		}
 
 		end := time.Now()
