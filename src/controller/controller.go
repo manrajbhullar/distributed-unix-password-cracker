@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -35,6 +36,7 @@ type Settings struct {
 	Username          string
 	Port              int
 	HeartbeatInterval int
+	ChunkSize         int
 }
 
 type PasswordInfo struct {
@@ -48,8 +50,11 @@ type WorkerInfo struct {
 	Conn   net.Conn
 	ID     string
 	Addr   string
-	JobID  int
 	HasJob bool
+
+	CurrentJobID      int
+	CurrentChunkStart int64
+	CurrentChunkSize  int
 
 	RuntimeStart        *time.Time
 	DispatchLatency     *float64
@@ -69,6 +74,17 @@ type Context struct {
 	NextJobID    int
 	NextWorkerID int
 
+	NextChunkStart int64
+	FoundFlag      int32 // atomic
+	FoundPassword  string
+	FoundByWorker  string
+	FoundTime      time.Time
+
+	TotalAttempts  int64 // atomic, accumulated across all chunks
+	CrackStartTime *time.Time
+
+	Done chan struct{}
+
 	ParseStart *time.Time
 	ParseEnd   *time.Time
 	ParseTime  *float64
@@ -84,19 +100,21 @@ func parse_arguments(ctx *Context) State {
 	var username string
 	var port int
 	var heartbeat int
+	var chunkSize int
 
 	fs.StringVar(&filename, "f", "", "Name of shadow file")
 	fs.StringVar(&username, "u", "", "Username whose password being cracked")
 	fs.IntVar(&port, "p", 0, "Port number control server runs on")
 	fs.IntVar(&heartbeat, "b", -1, "Heartbeat interval in seconds")
+	fs.IntVar(&chunkSize, "c", 0, "Chunk size in number of candidates per job")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		ctx.ExitMessage = err.Error()
 		return StateError
 	}
 
-	if filename == "" || username == "" || port == 0 || heartbeat == -1 {
-		fmt.Fprintln(os.Stderr, "Missing required flags: -f -u -p -b")
+	if filename == "" || username == "" || port == 0 || heartbeat == -1 || chunkSize == 0 {
+		fmt.Fprintln(os.Stderr, "Missing required flags: -f -u -p -b -c")
 		fs.Usage()
 		ctx.ExitMessage = "Missing required flags"
 		return StateError
@@ -106,6 +124,7 @@ func parse_arguments(ctx *Context) State {
 	ctx.Settings.Username = username
 	ctx.Settings.Port = port
 	ctx.Settings.HeartbeatInterval = heartbeat
+	ctx.Settings.ChunkSize = chunkSize
 
 	return StateHandleArgs
 }
@@ -120,6 +139,11 @@ func handle_arguments(ctx *Context) State {
 	heartbeat := ctx.Settings.HeartbeatInterval
 	if heartbeat <= 0 {
 		ctx.ExitMessage = "ERROR: Heartbeat interval must be greater than 0"
+		return StateError
+	}
+
+	if ctx.Settings.ChunkSize <= 0 {
+		ctx.ExitMessage = "ERROR: Chunk size must be greater than 0"
 		return StateError
 	}
 
@@ -301,8 +325,6 @@ func handleWorker(ctx *Context, conn net.Conn) {
 	shortID := worker.ID
 
 	// Per-worker message loop
-	heartbeatSec := ctx.Settings.HeartbeatInterval
-
 	for {
 		msg, err := recvMsg(conn)
 		if err != nil {
@@ -310,7 +332,9 @@ func handleWorker(ctx *Context, conn net.Conn) {
 			delete(ctx.Workers, worker.ID)
 			ctx.WorkersMu.Unlock()
 			_ = conn.Close()
-			fmt.Printf("\nWORKER DISCONNECTED (WorkerID: %s) - connection lost\n", shortID)
+			if atomic.LoadInt32(&ctx.FoundFlag) == 0 {
+				fmt.Printf("\nWORKER DISCONNECTED (WorkerID: %s) - connection lost\n", shortID)
+			}
 			return
 		}
 
@@ -326,11 +350,12 @@ func handleWorker(ctx *Context, conn net.Conn) {
 			threadsActive := intFromAny(msg["threads_active"])
 			rate := floatFromAny(msg["current_rate"])
 
-			fmt.Printf("\nHEARTBEAT (WorkerID: %s) (every %d sec)\n", shortID, heartbeatSec)
+			fmt.Printf("\nHEARTBEAT (WorkerID: %s)\n", shortID)
 			fmt.Printf("  Delta Tested: %.0f\n", delta)
 			fmt.Printf("  Total Attempts: %.0f\n", total)
 			fmt.Printf("  Threads Active: %d\n", threadsActive)
 			fmt.Printf("  Current Rate: %.2f hashes/sec\n", rate)
+			fmt.Printf("  Current Job: %d\n", worker.CurrentJobID)
 
 		case "result":
 			_ = sendMsg(conn, map[string]any{"type": "result_ack"})
@@ -346,14 +371,54 @@ func handleWorker(ctx *Context, conn net.Conn) {
 			}
 			worker.ResultReturnLatency = &rrl
 
-			report_result(ctx, worker, shortID, msg)
+			found := boolFromAny(msg["found"])
+			chunkEnd := worker.CurrentChunkStart + int64(worker.CurrentChunkSize)
+			attempts := floatFromAny(msg["attempts"])
+			atomic.AddInt64(&ctx.TotalAttempts, int64(attempts))
+			crackTime := floatFromAny(msg["compute_time"])
+			hps := 0.0
+			if crackTime > 0 {
+				hps = attempts / crackTime
+			}
+			resultMs := 0.0
+			if worker.ResultReturnLatency != nil {
+				resultMs = (*worker.ResultReturnLatency) * 1000
+			}
+			fmt.Printf("\nJOB #%d COMPLETE (WorkerID: %s)\n", worker.CurrentJobID, shortID)
+			fmt.Printf("  Status: %s\n", strFromAny(msg["status"]))
+			fmt.Printf("  Chunk: %d to %d\n", worker.CurrentChunkStart, chunkEnd)
+			fmt.Printf("  Attempts: %.0f\n", attempts)
+			fmt.Printf("  Time: %.2f seconds\n", crackTime)
+			fmt.Printf("  Speed: %.2f hashes/sec\n", hps)
+			fmt.Printf("  Result Latency: %.2f ms\n", resultMs)
+
+			if found {
+				// First worker to find the password wins
+				if atomic.CompareAndSwapInt32(&ctx.FoundFlag, 0, 1) {
+					ctx.WorkersMu.Lock()
+					ctx.FoundPassword, _ = msg["password"].(string)
+					ctx.FoundByWorker = worker.ID
+					ctx.FoundTime = time.Now()
+					// Broadcast force_stop to all other active workers immediately
+					for id, w := range ctx.Workers {
+						if id != worker.ID {
+							_ = sendMsg(w.Conn, map[string]any{"type": "force_stop"})
+						}
+					}
+					ctx.WorkersMu.Unlock()
+					report_result(ctx, shortID, msg)
+					close(ctx.Done)
+				}
+			}
 
 		case "disconnect":
 			ctx.WorkersMu.Lock()
 			delete(ctx.Workers, worker.ID)
 			ctx.WorkersMu.Unlock()
 			_ = conn.Close()
-			fmt.Printf("\nWORKER DISCONNECTED (WorkerID: %s) - worker exited\n", shortID)
+			if atomic.LoadInt32(&ctx.FoundFlag) == 0 {
+				fmt.Printf("\nWORKER DISCONNECTED (WorkerID: %s) - worker exited\n", shortID)
+			}
 			return
 
 		default:
@@ -407,17 +472,34 @@ func register_worker(ctx *Context, conn net.Conn, addr string) (*WorkerInfo, err
 }
 
 // send_chunk assigns the next available portion of the search space to a
-// requesting worker. For now sends the full search space (no chunking yet).
+// requesting worker, or sends STOP if the password has already been found.
 func send_chunk(ctx *Context, worker *WorkerInfo, shortID string) {
+	// If password already found, tell this worker to stop
+	if atomic.LoadInt32(&ctx.FoundFlag) == 1 {
+		_ = sendMsg(worker.Conn, map[string]any{"type": "stop"})
+		return
+	}
+
 	ctx.WorkersMu.Lock()
 	jobID := ctx.NextJobID
 	ctx.NextJobID++
-	worker.JobID = jobID
+	chunkStart := ctx.NextChunkStart
+	chunkSize := ctx.Settings.ChunkSize
+	ctx.NextChunkStart += int64(chunkSize)
+	worker.CurrentJobID = jobID
+	worker.CurrentChunkStart = chunkStart
+	worker.CurrentChunkSize = chunkSize
 	worker.HasJob = true
+	if ctx.CrackStartTime == nil {
+		now := time.Now()
+		ctx.CrackStartTime = &now
+	}
 	ctx.WorkersMu.Unlock()
 
-	now := time.Now()
-	worker.RuntimeStart = &now
+	if worker.RuntimeStart == nil {
+		now := time.Now()
+		worker.RuntimeStart = &now
+	}
 
 	charset := "abcdefghijklmnopqrstuvwxyz" +
 		"ABCDEFGHIJKLMNOPQRSTUVWXYZ" +
@@ -433,6 +515,8 @@ func send_chunk(ctx *Context, worker *WorkerInfo, shortID string) {
 		"hash":        ctx.PwInfo.Hash,
 		"hash_full":   ctx.PwInfo.Full,
 		"charset":     charset,
+		"chunk_start": chunkStart,
+		"chunk_size":  chunkSize,
 		"hb_interval": ctx.Settings.HeartbeatInterval,
 	}
 
@@ -467,71 +551,52 @@ func send_chunk(ctx *Context, worker *WorkerInfo, shortID string) {
 	}
 
 	fmt.Printf("\nDISPATCHED JOB #%d (WorkerID: %s)\n", jobID, shortID)
+	fmt.Printf("  Chunk: %d to %d\n", chunkStart, chunkStart+int64(chunkSize))
 	fmt.Printf("  Dispatch Latency: %.2f milliseconds (C -> W)\n", lat*1000)
 }
 
-// report_result displays the final cracking result and timing breakdown
-// for a single worker's completed job.
-func report_result(ctx *Context, worker *WorkerInfo, shortID string, msg map[string]any) {
-	found := boolFromAny(msg["found"])
-	var statusValue string
-	var passwordValue string
-	if found {
-		statusValue = "SUCCESS"
-		passwordValue, _ = msg["password"].(string)
-	} else {
-		statusValue = "FAILED"
-		passwordValue = "N/A"
+// report_result displays the overall cracking summary once the password is found.
+func report_result(ctx *Context, shortID string, msg map[string]any) {
+	passwordValue, _ := msg["password"].(string)
+
+	totalAttempts := atomic.LoadInt64(&ctx.TotalAttempts)
+
+	e2e := 0.0
+	if ctx.CrackStartTime != nil {
+		e2e = time.Since(*ctx.CrackStartTime).Seconds()
 	}
 
-	attempts := floatFromAny(msg["attempts"])
-	crackTime := floatFromAny(msg["compute_time"])
-
-	hps := 0.0
-	if crackTime > 0 {
-		hps = attempts / crackTime
+	overallHps := 0.0
+	if e2e > 0 {
+		overallHps = float64(totalAttempts) / e2e
 	}
 
 	parseMs := 0.0
 	if ctx.ParseTime != nil {
 		parseMs = (*ctx.ParseTime) * 1000
 	}
-	dispatchMs := 0.0
-	if worker.DispatchLatency != nil {
-		dispatchMs = (*worker.DispatchLatency) * 1000
-	}
-	resultMs := 0.0
-	if worker.ResultReturnLatency != nil {
-		resultMs = (*worker.ResultReturnLatency) * 1000
-	}
 
-	runtime := 0.0
-	if worker.RuntimeStart != nil {
-		runtime = time.Since(*worker.RuntimeStart).Seconds()
-	}
-
-	fmt.Println("\n" + strings.Repeat("=", 40))
-	fmt.Printf("     CRACKING RESULTS (WorkerID: %s)\n", shortID)
-	fmt.Println(strings.Repeat("=", 40))
-
-	labelWidth := 20
-	fmt.Printf("%-*s %s\n", labelWidth, "STATUS:", statusValue)
-	fmt.Printf("%-*s %s\n", labelWidth, "PASSWORD:", passwordValue)
-	fmt.Printf("%-*s %.0f\n", labelWidth, "ATTEMPTS:", attempts)
-	fmt.Printf("%-*s %.2f seconds\n", labelWidth, "TIME:", crackTime)
-	fmt.Printf("%-*s %.2f hashes/sec\n", labelWidth, "SPEED:", hps)
-	fmt.Printf("%-*s %.2f milliseconds\n", labelWidth, "PARSING TIME:", parseMs)
-	fmt.Printf("%-*s %.2f milliseconds\n", labelWidth, "DISPATCH LATENCY:", dispatchMs)
-	fmt.Printf("%-*s %.2f milliseconds\n", labelWidth, "RESULT LATENCY:", resultMs)
-	fmt.Printf("%-*s %.2f seconds\n", labelWidth, "E2E RUNTIME:", runtime)
+	const boxWidth = 40
+	title := "CRACKING RESULTS"
+	pad := strings.Repeat(" ", (boxWidth-len(title))/2)
+	fmt.Println("\n" + strings.Repeat("=", boxWidth))
+	fmt.Printf("%s%s\n", pad, title)
+	fmt.Println(strings.Repeat("=", boxWidth))
+	fmt.Printf("  STATUS: SUCCESS\n")
+	fmt.Printf("  PASSWORD: %s\n", passwordValue)
+	fmt.Printf("  TOTAL ATTEMPTS: %d\n", totalAttempts)
+	fmt.Printf("  E2E RUNTIME: %.2f seconds\n", e2e)
+	fmt.Printf("  OVERALL SPEED: %.2f hashes/sec\n", overallHps)
+	fmt.Printf("  PARSING TIME: %.2f milliseconds\n", parseMs)
+	fmt.Printf("  CRACKED BY: Worker %s\n", shortID)
 	fmt.Println(strings.Repeat("=", 40))
 }
 
 // monitor_progress tracks all active workers and receives updates.
-// Blocks forever — per-worker goroutines handle all the work.
-// Controller exits only via SIGINT/SIGTERM → cleanup.
-func monitor_progress(_ *Context) State {
-	select {}
+// Blocks until a worker finds the password or SIGINT/SIGTERM triggers cleanup.
+func monitor_progress(ctx *Context) State {
+	<-ctx.Done
+	return StateCleanup
 }
 
 func state_error(ctx *Context) State {
@@ -562,6 +627,7 @@ func main() {
 		Workers:      make(map[string]*WorkerInfo),
 		NextJobID:    1,
 		NextWorkerID: 1,
+		Done:         make(chan struct{}),
 	}
 
 	handlers := map[State]Handler{
