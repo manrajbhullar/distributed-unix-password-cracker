@@ -8,10 +8,8 @@ package main
 import "C"
 
 import (
-	"crypto/rand"
 	"crypto/subtle"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -43,7 +41,7 @@ const (
 	StateHandleArgs
 	StateConnect
 	StateRegister
-	StateWaitJob
+	StateRequestJob
 	StateCrack
 	StateSendResult
 	StateError
@@ -116,8 +114,6 @@ func handle_arguments(ctx *Context) State {
 		return StateError
 	}
 
-	ctx.WorkerID = newUUID()
-	fmt.Printf("\nWORKER ID: %s\n", ctx.WorkerID)
 	fmt.Printf("THREADS: %d\n", ctx.Settings.Threads)
 
 	return StateConnect
@@ -148,8 +144,7 @@ func register(ctx *Context) State {
 	fmt.Println("  Sending registration request...")
 
 	register_msg := map[string]any{
-		"type":      "register",
-		"worker_id": ctx.WorkerID,
+		"type": "register",
 	}
 	if err := sendMsg(ctx.Controller, register_msg); err != nil {
 		ctx.ExitMessage = fmt.Sprintf("ERROR: Registration failed. %v", err)
@@ -168,13 +163,23 @@ func register(ctx *Context) State {
 		return StateError
 	}
 
-	fmt.Println("  Worker registered successfully")
-	return StateWaitJob
+	ctx.WorkerID = strFromAny(resp["worker_id"])
+	fmt.Printf("  Worker registered successfully (WorkerID: %s)\n", ctx.WorkerID)
+	return StateRequestJob
 }
 
-func receive_job(ctx *Context) State {
+func request_job(ctx *Context) State {
 	fmt.Printf("\nWORKER READY\n")
-	fmt.Println("  Waiting for job from controller...")
+	fmt.Println("  Requesting job from controller...")
+
+	req := map[string]any{
+		"type":      "job_request",
+		"worker_id": ctx.WorkerID,
+	}
+	if err := sendMsg(ctx.Controller, req); err != nil {
+		ctx.ExitMessage = fmt.Sprintf("ERROR: Job request failed. %v", err)
+		return StateError
+	}
 
 	job, err := recvMsg(ctx.Controller)
 	if err != nil {
@@ -284,7 +289,7 @@ func crack(ctx *Context) State {
 				}
 				lastReported = total
 				lastTime = now
-				fmt.Printf("  Sent heartbeat response (%s)\n", timestamp)
+				fmt.Printf("  Sent heartbeat response (WorkerID: %s) (%s)\n", ctx.WorkerID, timestamp)
 			}
 		}
 	}()
@@ -475,7 +480,15 @@ func send_result(ctx *Context) State {
 
 	fmt.Printf("\nRESULT SENT TO CONTROLLER\n")
 	fmt.Printf("  Result Return Latency: %.2f milliseconds (W -> C)\n", lat*1000)
-	fmt.Printf("\nJOB #1 COMPLETE\n")
+	fmt.Printf("\nJOB #%d COMPLETE\n", intFromAny(ctx.JobData["job_id"]))
+
+	// Notify controller we are disconnecting
+	ctx.sendMu.Lock()
+	_ = sendMsg(ctx.Controller, map[string]any{
+		"type":      "disconnect",
+		"worker_id": ctx.WorkerID,
+	})
+	ctx.sendMu.Unlock()
 
 	return StateCleanup
 }
@@ -504,7 +517,7 @@ func main() {
 		StateHandleArgs: handle_arguments,
 		StateConnect:    connect,
 		StateRegister:   register,
-		StateWaitJob:    receive_job,
+		StateRequestJob:    request_job,
 		StateCrack:      crack,
 		StateSendResult: send_result,
 		StateError:      error_state,
@@ -585,12 +598,6 @@ func recvWithTimeout(conn net.Conn, seconds float64) (map[string]any, error) {
 }
 
 // ---------- Helpers ----------
-
-func newUUID() string {
-	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
-}
 
 func strFromAny(v any) string {
 	s, _ := v.(string)

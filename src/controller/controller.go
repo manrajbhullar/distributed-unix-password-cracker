@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -22,11 +23,9 @@ const (
 	StateHandleArgs
 	StateParseShadow
 	StateListen
-	StateWaitRegister
-	StateReceiveRegistration
+	StateRegisterWorker
+	StateMonitorProgress
 	StateDispatchJob
-	StateWaitResult
-	StateReportResults
 	StateError
 	StateCleanup
 )
@@ -45,31 +44,34 @@ type PasswordInfo struct {
 	Full  string
 }
 
+type WorkerInfo struct {
+	Conn   net.Conn
+	ID     string
+	Addr   string
+	JobID  int
+	HasJob bool
+
+	RuntimeStart        *time.Time
+	DispatchLatency     *float64
+	ResultReturnLatency *float64
+}
+
 type Context struct {
 	Settings    Settings
 	ExitMessage string
 
 	PwInfo PasswordInfo
 
-	ServerLn   net.Listener
-	WorkerConn net.Conn
-	WorkerAddr string
+	ServerLn net.Listener
 
-	WorkerID string
-	JobID    int
+	Workers      map[string]*WorkerInfo
+	WorkersMu    sync.Mutex
+	NextJobID    int
+	NextWorkerID int
 
 	ParseStart *time.Time
 	ParseEnd   *time.Time
 	ParseTime  *float64
-
-	RuntimeStart *time.Time
-	RuntimeEnd   *time.Time
-	Runtime      *float64
-
-	DispatchLatency     *float64
-	ResultReturnLatency *float64
-
-	FinalResult map[string]any
 }
 
 type Handler func(*Context) State
@@ -255,77 +257,165 @@ func listen(ctx *Context) State {
 	}
 	ctx.ServerLn = ln
 	fmt.Printf("\nLISTENING ON PORT: %d\n", ctx.Settings.Port)
-	return StateWaitRegister
+
+	// Accept loop — continuously accepts new worker connections
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return // Listener closed during cleanup
+			}
+			go handleWorker(ctx, conn)
+		}
+	}()
+
+	return StateMonitorProgress
 }
 
-func accept_worker(ctx *Context) State {
-	if ctx.ServerLn == nil {
-		ctx.ExitMessage = "ERROR: Control server failed to start."
-		return StateError
-	}
+// handleWorker manages one worker connection lifecycle.
+// Calls register_worker, then loops reading messages and
+// calls send_chunk to dispatch jobs.
+func handleWorker(ctx *Context, conn net.Conn) {
+	addr := conn.RemoteAddr().String()
+	fmt.Printf("\nWORKER CONNECTED FROM: %s\n", addr)
 
-	conn, err := ctx.ServerLn.Accept()
+	// Register the worker
+	worker, err := register_worker(ctx, conn, addr)
 	if err != nil {
-		ctx.ExitMessage = fmt.Sprintf("ERROR: Worker connection attempt failed. %v", err)
-		return StateError
+		fmt.Printf("  ERROR: Worker from %s failed to register. %v\n", addr, err)
+		_ = conn.Close()
+		return
 	}
 
-	ctx.WorkerConn = conn
-	ctx.WorkerAddr = conn.RemoteAddr().String()
+	shortID := worker.ID
 
-	fmt.Printf("\nWORKER CONNECTED FROM: %s\n", ctx.WorkerAddr)
-	return StateReceiveRegistration
+	// Per-worker message loop
+	heartbeatSec := ctx.Settings.HeartbeatInterval
+
+	for {
+		msg, err := recvMsg(conn)
+		if err != nil {
+			ctx.WorkersMu.Lock()
+			delete(ctx.Workers, worker.ID)
+			ctx.WorkersMu.Unlock()
+			_ = conn.Close()
+			fmt.Printf("\nWORKER DISCONNECTED (WorkerID: %s) - connection lost\n", shortID)
+			return
+		}
+
+		typ := strFromAny(msg["type"])
+
+		switch typ {
+		case "job_request":
+			send_chunk(ctx, worker, shortID)
+
+		case "heartbeat_resp":
+			delta := floatFromAny(msg["delta_tested"])
+			total := floatFromAny(msg["total_tested"])
+			threadsActive := intFromAny(msg["threads_active"])
+			rate := floatFromAny(msg["current_rate"])
+
+			fmt.Printf("\nHEARTBEAT (WorkerID: %s) (every %d sec)\n", shortID, heartbeatSec)
+			fmt.Printf("  Delta Tested: %.0f\n", delta)
+			fmt.Printf("  Total Attempts: %.0f\n", total)
+			fmt.Printf("  Threads Active: %d\n", threadsActive)
+			fmt.Printf("  Current Rate: %.2f hashes/sec\n", rate)
+
+		case "result":
+			_ = sendMsg(conn, map[string]any{"type": "result_ack"})
+
+			latMsg, err := recvMsg(conn)
+			if err != nil {
+				fmt.Printf("  WARNING: Failed to receive result latency from worker %s\n", shortID)
+			}
+
+			rrl := 0.0
+			if latMsg != nil {
+				rrl = floatFromAny(latMsg["result_return_latency"])
+			}
+			worker.ResultReturnLatency = &rrl
+
+			report_result(ctx, worker, shortID, msg)
+
+		case "disconnect":
+			ctx.WorkersMu.Lock()
+			delete(ctx.Workers, worker.ID)
+			ctx.WorkersMu.Unlock()
+			_ = conn.Close()
+			fmt.Printf("\nWORKER DISCONNECTED (WorkerID: %s) - worker exited\n", shortID)
+			return
+
+		default:
+			fmt.Printf("  Received unexpected message from worker %s: %s\n", shortID, typ)
+		}
+	}
 }
 
-func receive_registration(ctx *Context) State {
-	if ctx.WorkerConn == nil {
-		ctx.ExitMessage = "ERROR: No worker socket"
-		return StateError
-	}
-
+// register_worker accepts and records a worker registration so it can
+// participate in cracking.
+func register_worker(ctx *Context, conn net.Conn, addr string) (*WorkerInfo, error) {
 	fmt.Println("  Waiting for worker to send registration request...")
 
-	registrationReq, err := recvWithTimeout(ctx.WorkerConn, 5*time.Second)
+	registrationReq, err := recvWithTimeout(conn, 5*time.Second)
 	if err != nil {
-		ctx.ExitMessage = fmt.Sprintf("ERROR: Worker failed to register. %v", err)
-		return StateWaitRegister
+		return nil, err
 	}
 
 	fmt.Println("  Worker registration request received")
 
 	if typ, _ := registrationReq["type"].(string); typ != "register" {
-		_ = sendMsg(ctx.WorkerConn, map[string]any{
+		_ = sendMsg(conn, map[string]any{
 			"type":   "registration_err",
 			"reason": "bad register",
 		})
-		return StateError
+		return nil, fmt.Errorf("bad registration type: %s", typ)
 	}
 
-	workerID, _ := registrationReq["worker_id"].(string)
-	ctx.WorkerID = workerID
+	ctx.WorkersMu.Lock()
+	workerID := fmt.Sprintf("%d", ctx.NextWorkerID)
+	ctx.NextWorkerID++
+	ctx.WorkersMu.Unlock()
 
-	_ = sendMsg(ctx.WorkerConn, map[string]any{"type": "registration_ok"})
-	fmt.Printf("  Worker registered successfully (%s)\n", ctx.WorkerID)
-	return StateDispatchJob
+	_ = sendMsg(conn, map[string]any{
+		"type":      "registration_ok",
+		"worker_id": workerID,
+	})
+
+	worker := &WorkerInfo{
+		Conn: conn,
+		ID:   workerID,
+		Addr: addr,
+	}
+
+	ctx.WorkersMu.Lock()
+	ctx.Workers[workerID] = worker
+	ctx.WorkersMu.Unlock()
+
+	fmt.Printf("  Worker registered successfully (WorkerID: %s)\n", workerID)
+	return worker, nil
 }
 
-func dispatch_job(ctx *Context) State {
+// send_chunk assigns the next available portion of the search space to a
+// requesting worker. For now sends the full search space (no chunking yet).
+func send_chunk(ctx *Context, worker *WorkerInfo, shortID string) {
+	ctx.WorkersMu.Lock()
+	jobID := ctx.NextJobID
+	ctx.NextJobID++
+	worker.JobID = jobID
+	worker.HasJob = true
+	ctx.WorkersMu.Unlock()
+
 	now := time.Now()
-	ctx.RuntimeStart = &now
+	worker.RuntimeStart = &now
 
 	charset := "abcdefghijklmnopqrstuvwxyz" +
 		"ABCDEFGHIJKLMNOPQRSTUVWXYZ" +
 		"0123456789" +
 		"@#%^&*()_+-=.,:;?"
 
-	if ctx.WorkerConn == nil {
-		ctx.ExitMessage = "No connected worker"
-		return StateError
-	}
-
 	job := map[string]any{
 		"type":        "job",
-		"job_id":      ctx.JobID,
+		"job_id":      jobID,
 		"username":    ctx.Settings.Username,
 		"alg_id":      ctx.PwInfo.AlgID,
 		"salt":        ctx.PwInfo.Salt,
@@ -336,152 +426,82 @@ func dispatch_job(ctx *Context) State {
 	}
 
 	dispatchStart := time.Now()
-	if err := sendMsg(ctx.WorkerConn, job); err != nil {
-		ctx.ExitMessage = fmt.Sprintf("ERROR: Dispatch of job to worker failed. %v", err)
-		return StateError
+	if err := sendMsg(worker.Conn, job); err != nil {
+		ctx.WorkersMu.Lock()
+		delete(ctx.Workers, worker.ID)
+		ctx.WorkersMu.Unlock()
+		_ = worker.Conn.Close()
+		fmt.Printf("\nWORKER DISCONNECTED (WorkerID: %s) - failed to send job\n", shortID)
+		return
 	}
 
-	ack, err := recvMsg(ctx.WorkerConn)
+	ack, err := recvMsg(worker.Conn)
 	if err != nil {
-		ctx.ExitMessage = fmt.Sprintf("ERROR: Dispatch of job to worker failed. %v", err)
-		return StateError
-	}
-
-	typ, _ := ack["type"].(string)
-	jobID := intFromAny(ack["job_id"])
-	if typ != "job_ack" || jobID != ctx.JobID {
-		ctx.ExitMessage = fmt.Sprintf("ERROR: Expected job_ack, got: %v", ack)
-		return StateError
+		ctx.WorkersMu.Lock()
+		delete(ctx.Workers, worker.ID)
+		ctx.WorkersMu.Unlock()
+		_ = worker.Conn.Close()
+		fmt.Printf("\nWORKER DISCONNECTED (WorkerID: %s) - no job ack\n", shortID)
+		return
 	}
 
 	dispatchEnd := time.Now()
 	lat := dispatchEnd.Sub(dispatchStart).Seconds()
-	ctx.DispatchLatency = &lat
+	worker.DispatchLatency = &lat
 
-	fmt.Printf("\nDISPATCHED JOB #%d (Worker: %s)\n", ctx.JobID, ctx.WorkerID)
+	ackType := strFromAny(ack["type"])
+	ackJobID := intFromAny(ack["job_id"])
+	if ackType != "job_ack" || ackJobID != jobID {
+		fmt.Printf("  WARNING: Unexpected ack from worker %s: %v\n", shortID, ack)
+	}
+
+	fmt.Printf("\nDISPATCHED JOB #%d (WorkerID: %s)\n", jobID, shortID)
 	fmt.Printf("  Dispatch Latency: %.2f milliseconds (C -> W)\n", lat*1000)
-	return StateWaitResult
 }
 
-func wait_result(ctx *Context) State {
-	fmt.Println("  Waiting for worker to finish cracking...")
-
-	if ctx.WorkerConn == nil {
-		ctx.ExitMessage = "ERROR: Failed to receive result. no worker connection"
-		return StateError
-	}
-
-	heartbeatSec := ctx.Settings.HeartbeatInterval
-	heartbeatDur := time.Duration(heartbeatSec) * time.Second
-
-	missed := 0
-	maxMisses := 2
-
-	grace := 500 * time.Millisecond
-	timeout := heartbeatDur + grace
-
-	for {
-		msg, err := recvWithTimeout(ctx.WorkerConn, timeout)
-		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				missed++
-				if missed > maxMisses {
-					ctx.ExitMessage = fmt.Sprintf(
-						"ERROR: Worker unresponsive (no message for %d seconds)",
-						heartbeatSec*missed,
-					)
-					return StateError
-				}
-
-				fmt.Printf(
-					"\nHEARTBEAT MISS: No response from worker in last %d sec (miss %d). Waiting again...\n",
-					heartbeatSec,
-					missed,
-				)
-				continue
-			}
-
-			ctx.ExitMessage = "ERROR: Failed to receive message from worker"
-			return StateError
-		}
-
-		missed = 0
-		typ := strFromAny(msg["type"])
-
-		if typ == "result" {
-			_ = sendMsg(ctx.WorkerConn, map[string]any{"type": "result_ack"})
-
-			latMsg, err := recvMsg(ctx.WorkerConn)
-			if err != nil {
-				ctx.ExitMessage = fmt.Sprintf(
-					"ERROR: Failed to receive result latency message. %v",
-					err,
-				)
-				return StateError
-			}
-
-			rrl := floatFromAny(latMsg["result_return_latency"])
-			ctx.ResultReturnLatency = &rrl
-
-			// Store final result for report state
-			ctx.FinalResult = msg
-
-			end := time.Now()
-			ctx.RuntimeEnd = &end
-			runtime := end.Sub(*ctx.RuntimeStart).Seconds()
-			ctx.Runtime = &runtime
-
-			return StateReportResults
-		}
-
-		if typ == "heartbeat_resp" {
-			delta := floatFromAny(msg["delta_tested"])
-			total := floatFromAny(msg["total_tested"])
-			threadsActive := intFromAny(msg["threads_active"])
-			rate := floatFromAny(msg["current_rate"])
-
-			fmt.Printf("\nHEARTBEAT (every %d sec)\n", heartbeatSec)
-			fmt.Printf("  Delta Tested: %.0f\n", delta)
-			fmt.Printf("  Total Attempts: %.0f\n", total)
-			fmt.Printf("  Threads Active: %d\n", threadsActive)
-			fmt.Printf("  Current Rate: %.2f hashes/sec\n", rate)
-
-			continue
-		}
-
-		fmt.Println("  Received unexpected message while waiting")
-	}
-}
-
-func report_results(ctx *Context) State {
-	result := ctx.FinalResult
-	if result == nil {
-		ctx.ExitMessage = "ERROR: No final result to report"
-		return StateError
-	}
-
-	fmt.Println("\n" + strings.Repeat("=", 40))
-	fmt.Println("            CRACKING RESULTS")
-	fmt.Println(strings.Repeat("=", 40))
-
-	found := boolFromAny(result["found"])
+// report_result displays the final cracking result and timing breakdown
+// for a single worker's completed job.
+func report_result(ctx *Context, worker *WorkerInfo, shortID string, msg map[string]any) {
+	found := boolFromAny(msg["found"])
 	var statusValue string
 	var passwordValue string
 	if found {
 		statusValue = "SUCCESS"
-		passwordValue, _ = result["password"].(string)
+		passwordValue, _ = msg["password"].(string)
 	} else {
 		statusValue = "FAILED"
 		passwordValue = "N/A"
 	}
 
-	attempts := floatFromAny(result["attempts"])
-	crackTime := floatFromAny(result["compute_time"])
+	attempts := floatFromAny(msg["attempts"])
+	crackTime := floatFromAny(msg["compute_time"])
 
 	hps := 0.0
 	if crackTime > 0 {
 		hps = attempts / crackTime
 	}
+
+	parseMs := 0.0
+	if ctx.ParseTime != nil {
+		parseMs = (*ctx.ParseTime) * 1000
+	}
+	dispatchMs := 0.0
+	if worker.DispatchLatency != nil {
+		dispatchMs = (*worker.DispatchLatency) * 1000
+	}
+	resultMs := 0.0
+	if worker.ResultReturnLatency != nil {
+		resultMs = (*worker.ResultReturnLatency) * 1000
+	}
+
+	runtime := 0.0
+	if worker.RuntimeStart != nil {
+		runtime = time.Since(*worker.RuntimeStart).Seconds()
+	}
+
+	fmt.Println("\n" + strings.Repeat("=", 40))
+	fmt.Printf("     CRACKING RESULTS (WorkerID: %s)\n", shortID)
+	fmt.Println(strings.Repeat("=", 40))
 
 	labelWidth := 20
 	fmt.Printf("%-*s %s\n", labelWidth, "STATUS:", statusValue)
@@ -489,32 +509,18 @@ func report_results(ctx *Context) State {
 	fmt.Printf("%-*s %.0f\n", labelWidth, "ATTEMPTS:", attempts)
 	fmt.Printf("%-*s %.2f seconds\n", labelWidth, "TIME:", crackTime)
 	fmt.Printf("%-*s %.2f hashes/sec\n", labelWidth, "SPEED:", hps)
-
-	parseMs := 0.0
-	if ctx.ParseTime != nil {
-		parseMs = (*ctx.ParseTime) * 1000
-	}
-	dispatchMs := 0.0
-	if ctx.DispatchLatency != nil {
-		dispatchMs = (*ctx.DispatchLatency) * 1000
-	}
-	resultMs := 0.0
-	if ctx.ResultReturnLatency != nil {
-		resultMs = (*ctx.ResultReturnLatency) * 1000
-	}
-
-	runtime := 0.0
-	if ctx.Runtime != nil {
-		runtime = *ctx.Runtime
-	}
-
 	fmt.Printf("%-*s %.2f milliseconds\n", labelWidth, "PARSING TIME:", parseMs)
 	fmt.Printf("%-*s %.2f milliseconds\n", labelWidth, "DISPATCH LATENCY:", dispatchMs)
 	fmt.Printf("%-*s %.2f milliseconds\n", labelWidth, "RESULT LATENCY:", resultMs)
 	fmt.Printf("%-*s %.2f seconds\n", labelWidth, "E2E RUNTIME:", runtime)
 	fmt.Println(strings.Repeat("=", 40))
+}
 
-	return StateCleanup
+// monitor_progress tracks all active workers and receives updates.
+// Blocks forever — per-worker goroutines handle all the work.
+// Controller exits only via SIGINT/SIGTERM → cleanup.
+func monitor_progress(_ *Context) State {
+	select {}
 }
 
 func state_error(ctx *Context) State {
@@ -523,9 +529,12 @@ func state_error(ctx *Context) State {
 }
 
 func cleanup(ctx *Context) State {
-	if ctx.WorkerConn != nil {
-		_ = ctx.WorkerConn.Close()
+	ctx.WorkersMu.Lock()
+	for _, w := range ctx.Workers {
+		_ = w.Conn.Close()
 	}
+	ctx.WorkersMu.Unlock()
+
 	if ctx.ServerLn != nil {
 		_ = ctx.ServerLn.Close()
 	}
@@ -539,21 +548,19 @@ func main() {
 	fmt.Println("--- CONTROLLER ---")
 
 	ctx := &Context{
-		JobID: 1,
+		Workers:      make(map[string]*WorkerInfo),
+		NextJobID:    1,
+		NextWorkerID: 1,
 	}
 
 	handlers := map[State]Handler{
-		StateParseArgs:           parse_arguments,
-		StateHandleArgs:          handle_arguments,
-		StateParseShadow:         parse_shadow,
-		StateListen:              listen,
-		StateWaitRegister:        accept_worker,
-		StateReceiveRegistration: receive_registration,
-		StateDispatchJob:         dispatch_job,
-		StateWaitResult:          wait_result,
-		StateReportResults:       report_results,
-		StateError:               state_error,
-		StateCleanup:             cleanup,
+		StateParseArgs:       parse_arguments,
+		StateHandleArgs:      handle_arguments,
+		StateParseShadow:     parse_shadow,
+		StateListen:          listen,
+		StateMonitorProgress: monitor_progress,
+		StateError:           state_error,
+		StateCleanup:         cleanup,
 	}
 
 	sigCh := make(chan os.Signal, 1)
