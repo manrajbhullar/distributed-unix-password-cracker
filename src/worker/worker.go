@@ -52,6 +52,7 @@ type Settings struct {
 	ControllerHost string
 	ControllerPort int
 	Threads        int
+	ThreadsRaw     string
 }
 
 type Context struct {
@@ -78,11 +79,11 @@ func parse_arguments(ctx *Context) State {
 
 	var controller string
 	var port int
-	var threads int
+	var threadsStr string
 
 	fs.StringVar(&controller, "c", "", "Controller host or IP")
 	fs.IntVar(&port, "p", 0, "Controller port")
-	fs.IntVar(&threads, "t", 1, "Number of threads")
+	fs.StringVar(&threadsStr, "t", "1", "Number of threads (integer or \"max\" for NumCPU-1)")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		ctx.ExitMessage = err.Error()
@@ -98,7 +99,7 @@ func parse_arguments(ctx *Context) State {
 
 	ctx.Settings.ControllerHost = controller
 	ctx.Settings.ControllerPort = port
-	ctx.Settings.Threads = threads
+	ctx.Settings.ThreadsRaw = threadsStr
 
 	return StateHandleArgs
 }
@@ -110,9 +111,18 @@ func handle_arguments(ctx *Context) State {
 		return StateError
 	}
 
-	if ctx.Settings.Threads <= 0 {
-		ctx.ExitMessage = "ERROR: Threads must be greater than 0"
-		return StateError
+	if ctx.Settings.ThreadsRaw == "max" {
+		ctx.Settings.Threads = runtime.NumCPU() - 1
+		if ctx.Settings.Threads < 1 {
+			ctx.Settings.Threads = 1
+		}
+	} else {
+		n, err := strconv.Atoi(ctx.Settings.ThreadsRaw)
+		if err != nil || n <= 0 {
+			ctx.ExitMessage = fmt.Sprintf("ERROR: Invalid value for -t: %q (must be a positive integer or \"max\")", ctx.Settings.ThreadsRaw)
+			return StateError
+		}
+		ctx.Settings.Threads = n
 	}
 
 	fmt.Printf("THREADS: %d\n", ctx.Settings.Threads)
