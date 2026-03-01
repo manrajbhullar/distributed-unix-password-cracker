@@ -165,7 +165,11 @@ func register(ctx *Context) State {
 	}
 
 	ctx.WorkerID = strFromAny(resp["worker_id"])
-	fmt.Printf("  Worker registered successfully (WorkerID: %s)\n", ctx.WorkerID)
+	fmt.Printf("  Worker registered successfully (WorkerID: %s, User: %s, Alg_ID: %s)\n",
+		ctx.WorkerID,
+		strFromAny(resp["username"]),
+		strFromAny(resp["alg_id"]),
+	)
 	return StateRequestJob
 }
 
@@ -204,10 +208,10 @@ func request_job(ctx *Context) State {
 	}
 
 	ctx.JobData = job
-	fmt.Printf("  Job #%d received from controller -> (User: %s, Alg_ID: %s)\n",
+	fmt.Printf("  Job #%d received from controller -> (Chunk: %d to %d)\n",
 		intFromAny(job["job_id"]),
-		strFromAny(job["username"]),
-		strFromAny(job["alg_id"]),
+		int64FromAny(job["chunk_start"]),
+		int64FromAny(job["chunk_start"])+int64(intFromAny(job["chunk_size"])),
 	)
 
 	return StateCrack

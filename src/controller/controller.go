@@ -83,6 +83,9 @@ type Context struct {
 	TotalAttempts  int64 // atomic, accumulated across all chunks
 	CrackStartTime *time.Time
 
+	DispatchLatencies []float64
+	ResultLatencies   []float64
+
 	Done chan struct{}
 
 	ParseStart *time.Time
@@ -291,7 +294,7 @@ func listen(ctx *Context) State {
 		return StateError
 	}
 	ctx.ServerLn = ln
-	fmt.Printf("\nLISTENING ON PORT: %d\n", ctx.Settings.Port)
+	fmt.Printf("\nWAITING TO REGISTER WORKERS (Active: 0)\n")
 
 	// Accept loop — continuously accepts new worker connections
 	go func() {
@@ -334,6 +337,12 @@ func handleWorker(ctx *Context, conn net.Conn) {
 			_ = conn.Close()
 			if atomic.LoadInt32(&ctx.FoundFlag) == 0 {
 				fmt.Printf("\nWORKER DISCONNECTED (WorkerID: %s) - connection lost\n", shortID)
+				ctx.WorkersMu.Lock()
+				activeCount := len(ctx.Workers)
+				ctx.WorkersMu.Unlock()
+				if activeCount == 0 {
+					fmt.Printf("\nWAITING TO REGISTER WORKERS (Active: 0)\n")
+				}
 			}
 			return
 		}
@@ -384,12 +393,23 @@ func handleWorker(ctx *Context, conn net.Conn) {
 			if worker.ResultReturnLatency != nil {
 				resultMs = (*worker.ResultReturnLatency) * 1000
 			}
+			dispatchMs := 0.0
+			if worker.DispatchLatency != nil {
+				dispatchMs = (*worker.DispatchLatency) * 1000
+			}
+			ctx.WorkersMu.Lock()
+			if worker.DispatchLatency != nil {
+				ctx.DispatchLatencies = append(ctx.DispatchLatencies, *worker.DispatchLatency)
+			}
+			ctx.ResultLatencies = append(ctx.ResultLatencies, rrl)
+			ctx.WorkersMu.Unlock()
 			fmt.Printf("\nJOB #%d COMPLETE (WorkerID: %s)\n", worker.CurrentJobID, shortID)
 			fmt.Printf("  Status: %s\n", strFromAny(msg["status"]))
 			fmt.Printf("  Chunk: %d to %d\n", worker.CurrentChunkStart, chunkEnd)
 			fmt.Printf("  Attempts: %.0f\n", attempts)
 			fmt.Printf("  Time: %.2f seconds\n", crackTime)
 			fmt.Printf("  Speed: %.2f hashes/sec\n", hps)
+			fmt.Printf("  Dispatch Latency: %.2f ms\n", dispatchMs)
 			fmt.Printf("  Result Latency: %.2f ms\n", resultMs)
 
 			if found {
@@ -418,6 +438,12 @@ func handleWorker(ctx *Context, conn net.Conn) {
 			_ = conn.Close()
 			if atomic.LoadInt32(&ctx.FoundFlag) == 0 {
 				fmt.Printf("\nWORKER DISCONNECTED (WorkerID: %s) - worker exited\n", shortID)
+				ctx.WorkersMu.Lock()
+				activeCount := len(ctx.Workers)
+				ctx.WorkersMu.Unlock()
+				if activeCount == 0 {
+					fmt.Printf("\nWAITING TO REGISTER WORKERS (Active: 0)\n")
+				}
 			}
 			return
 
@@ -455,6 +481,8 @@ func register_worker(ctx *Context, conn net.Conn, addr string) (*WorkerInfo, err
 	_ = sendMsg(conn, map[string]any{
 		"type":      "registration_ok",
 		"worker_id": workerID,
+		"username":  ctx.Settings.Username,
+		"alg_id":    ctx.PwInfo.AlgID,
 	})
 
 	worker := &WorkerInfo{
@@ -576,20 +604,41 @@ func report_result(ctx *Context, shortID string, msg map[string]any) {
 		parseMs = (*ctx.ParseTime) * 1000
 	}
 
-	const boxWidth = 40
+	avgDispatchMs := 0.0
+	avgResultMs := 0.0
+	ctx.WorkersMu.Lock()
+	if len(ctx.DispatchLatencies) > 0 {
+		sum := 0.0
+		for _, v := range ctx.DispatchLatencies {
+			sum += v
+		}
+		avgDispatchMs = (sum / float64(len(ctx.DispatchLatencies))) * 1000
+	}
+	if len(ctx.ResultLatencies) > 0 {
+		sum := 0.0
+		for _, v := range ctx.ResultLatencies {
+			sum += v
+		}
+		avgResultMs = (sum / float64(len(ctx.ResultLatencies))) * 1000
+	}
+	ctx.WorkersMu.Unlock()
+
+	const boxWidth = 45
 	title := "CRACKING RESULTS"
 	pad := strings.Repeat(" ", (boxWidth-len(title))/2)
 	fmt.Println("\n" + strings.Repeat("=", boxWidth))
 	fmt.Printf("%s%s\n", pad, title)
 	fmt.Println(strings.Repeat("=", boxWidth))
-	fmt.Printf("  STATUS: SUCCESS\n")
-	fmt.Printf("  PASSWORD: %s\n", passwordValue)
-	fmt.Printf("  TOTAL ATTEMPTS: %d\n", totalAttempts)
-	fmt.Printf("  E2E RUNTIME: %.2f seconds\n", e2e)
-	fmt.Printf("  OVERALL SPEED: %.2f hashes/sec\n", overallHps)
-	fmt.Printf("  PARSING TIME: %.2f milliseconds\n", parseMs)
-	fmt.Printf("  CRACKED BY: Worker %s\n", shortID)
-	fmt.Println(strings.Repeat("=", 40))
+	fmt.Printf("STATUS: SUCCESS\n")
+	fmt.Printf("PASSWORD: %s\n", passwordValue)
+	fmt.Printf("TOTAL ATTEMPTS: %d\n", totalAttempts)
+	fmt.Printf("E2E RUNTIME: %.2f seconds\n", e2e)
+	fmt.Printf("OVERALL SPEED: %.2f hashes/sec\n", overallHps)
+	fmt.Printf("PARSING TIME: %.2f milliseconds\n", parseMs)
+	fmt.Printf("DISPATCH LATENCY (AVG): %.2f milliseconds\n", avgDispatchMs)
+	fmt.Printf("RESULT LATENCY (AVG): %.2f milliseconds\n", avgResultMs)
+	fmt.Printf("CRACKED BY: Worker #%s in Job #%d\n", shortID, intFromAny(msg["job_id"]))
+	fmt.Println(strings.Repeat("=", boxWidth))
 }
 
 // monitor_progress tracks all active workers and receives updates.
