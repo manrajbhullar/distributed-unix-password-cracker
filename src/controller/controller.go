@@ -78,7 +78,10 @@ type Context struct {
 	FoundFlag      int32 // atomic
 	FoundPassword  string
 	FoundByWorker  string
+	FoundByJobID   int
 	FoundTime      time.Time
+
+	WorkerWG sync.WaitGroup // counts active handleWorker goroutines
 
 	TotalAttempts  int64 // atomic, accumulated across all chunks
 	CrackStartTime *time.Time
@@ -303,7 +306,11 @@ func listen(ctx *Context) State {
 			if err != nil {
 				return // Listener closed during cleanup
 			}
-			go handleWorker(ctx, conn)
+			ctx.WorkerWG.Add(1)
+			go func() {
+				defer ctx.WorkerWG.Done()
+				handleWorker(ctx, conn)
+			}()
 		}
 	}()
 
@@ -426,6 +433,7 @@ func handleWorker(ctx *Context, conn net.Conn) {
 					ctx.WorkersMu.Lock()
 					ctx.FoundPassword, _ = msg["password"].(string)
 					ctx.FoundByWorker = worker.ID
+					ctx.FoundByJobID = intFromAny(msg["job_id"])
 					ctx.FoundTime = time.Now()
 					// Broadcast force_stop to all other active workers immediately
 					for id, w := range ctx.Workers {
@@ -434,7 +442,8 @@ func handleWorker(ctx *Context, conn net.Conn) {
 						}
 					}
 					ctx.WorkersMu.Unlock()
-					report_result(ctx, workerID, msg)
+					// Stop accepting new connections so WorkerWG can drain cleanly
+					_ = ctx.ServerLn.Close()
 					close(ctx.Done)
 				}
 			}
@@ -454,6 +463,11 @@ func handleWorker(ctx *Context, conn net.Conn) {
 				}
 			}
 			return
+
+		case "force_stop_ack":
+			attempts := floatFromAny(msg["attempts"])
+			atomic.AddInt64(&ctx.TotalAttempts, int64(attempts))
+			fmt.Printf("\nFORCE STOP ACK (WorkerID: %s)\n  Partial Attempts: %.0f\n", workerID, attempts)
 
 		default:
 			fmt.Printf("  Received unexpected message from worker %s: %s\n", workerID, typ)
@@ -614,8 +628,8 @@ func send_chunk(ctx *Context, worker *WorkerInfo, workerID string) {
 }
 
 // report_result displays the overall cracking summary once the password is found.
-func report_result(ctx *Context, workerID string, msg map[string]any) {
-	passwordValue, _ := msg["password"].(string)
+func report_result(ctx *Context) {
+	passwordValue := ctx.FoundPassword
 
 	totalAttempts := atomic.LoadInt64(&ctx.TotalAttempts)
 
@@ -667,7 +681,7 @@ func report_result(ctx *Context, workerID string, msg map[string]any) {
 	fmt.Printf("PARSING TIME: %.2f milliseconds\n", parseMs)
 	fmt.Printf("DISPATCH LATENCY (AVG): %.2f milliseconds\n", avgDispatchMs)
 	fmt.Printf("RESULT LATENCY (AVG): %.2f milliseconds\n", avgResultMs)
-	fmt.Printf("CRACKED BY: Worker #%s in Job #%d\n", workerID, intFromAny(msg["job_id"]))
+	fmt.Printf("CRACKED BY: Worker #%s in Job #%d\n", ctx.FoundByWorker, ctx.FoundByJobID)
 	fmt.Println(strings.Repeat("=", boxWidth))
 }
 
@@ -675,6 +689,15 @@ func report_result(ctx *Context, workerID string, msg map[string]any) {
 // Blocks until a worker finds the password or SIGINT/SIGTERM triggers cleanup.
 func monitor_progress(ctx *Context) State {
 	<-ctx.Done
+	// Wait for all handleWorker goroutines to finish so their force_stop_ack
+	// partial attempt counts are fully accumulated before reporting results.
+	waitCh := make(chan struct{})
+	go func() { ctx.WorkerWG.Wait(); close(waitCh) }()
+	select {
+	case <-waitCh:
+	case <-time.After(5 * time.Second):
+	}
+	report_result(ctx)
 	return StateCleanup
 }
 
