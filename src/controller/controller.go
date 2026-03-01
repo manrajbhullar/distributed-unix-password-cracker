@@ -325,18 +325,26 @@ func handleWorker(ctx *Context, conn net.Conn) {
 		return
 	}
 
-	shortID := worker.ID
+	workerID := worker.ID
+	hbTimeout := time.Duration(ctx.Settings.HeartbeatInterval)*time.Second + 500*time.Millisecond
 
 	// Per-worker message loop
 	for {
+		_ = conn.SetReadDeadline(time.Now().Add(hbTimeout))
 		msg, err := recvMsg(conn)
+		_ = conn.SetReadDeadline(time.Time{})
 		if err != nil {
+			netErr, ok := err.(net.Error)
+			if ok && netErr.Timeout() {
+				fmt.Printf("\nWORKER TIMEOUT (WorkerID: %s) - missed heartbeat\n", workerID)
+			} else {
+				fmt.Printf("\nWORKER DISCONNECTED (WorkerID: %s) - connection lost\n", workerID)
+			}
 			ctx.WorkersMu.Lock()
 			delete(ctx.Workers, worker.ID)
 			ctx.WorkersMu.Unlock()
 			_ = conn.Close()
 			if atomic.LoadInt32(&ctx.FoundFlag) == 0 {
-				fmt.Printf("\nWORKER DISCONNECTED (WorkerID: %s) - connection lost\n", shortID)
 				ctx.WorkersMu.Lock()
 				activeCount := len(ctx.Workers)
 				ctx.WorkersMu.Unlock()
@@ -351,7 +359,7 @@ func handleWorker(ctx *Context, conn net.Conn) {
 
 		switch typ {
 		case "job_request":
-			send_chunk(ctx, worker, shortID)
+			send_chunk(ctx, worker, workerID)
 
 		case "heartbeat_resp":
 			delta := floatFromAny(msg["delta_tested"])
@@ -359,7 +367,7 @@ func handleWorker(ctx *Context, conn net.Conn) {
 			threadsActive := intFromAny(msg["threads_active"])
 			rate := floatFromAny(msg["current_rate"])
 
-			fmt.Printf("\nHEARTBEAT (WorkerID: %s)\n", shortID)
+			fmt.Printf("\nHEARTBEAT (WorkerID: %s)\n", workerID)
 			fmt.Printf("  Delta Tested: %.0f\n", delta)
 			fmt.Printf("  Total Attempts: %.0f\n", total)
 			fmt.Printf("  Threads Active: %d\n", threadsActive)
@@ -371,7 +379,7 @@ func handleWorker(ctx *Context, conn net.Conn) {
 
 			latMsg, err := recvMsg(conn)
 			if err != nil {
-				fmt.Printf("  WARNING: Failed to receive result latency from worker %s\n", shortID)
+				fmt.Printf("  WARNING: Failed to receive result latency from worker %s\n", workerID)
 			}
 
 			rrl := 0.0
@@ -403,7 +411,7 @@ func handleWorker(ctx *Context, conn net.Conn) {
 			}
 			ctx.ResultLatencies = append(ctx.ResultLatencies, rrl)
 			ctx.WorkersMu.Unlock()
-			fmt.Printf("\nJOB #%d COMPLETE (WorkerID: %s)\n", worker.CurrentJobID, shortID)
+			fmt.Printf("\nJOB #%d COMPLETE (WorkerID: %s)\n", worker.CurrentJobID, workerID)
 			fmt.Printf("  Status: %s\n", strFromAny(msg["status"]))
 			fmt.Printf("  Chunk: %d to %d\n", worker.CurrentChunkStart, chunkEnd)
 			fmt.Printf("  Attempts: %.0f\n", attempts)
@@ -426,7 +434,7 @@ func handleWorker(ctx *Context, conn net.Conn) {
 						}
 					}
 					ctx.WorkersMu.Unlock()
-					report_result(ctx, shortID, msg)
+					report_result(ctx, workerID, msg)
 					close(ctx.Done)
 				}
 			}
@@ -437,7 +445,7 @@ func handleWorker(ctx *Context, conn net.Conn) {
 			ctx.WorkersMu.Unlock()
 			_ = conn.Close()
 			if atomic.LoadInt32(&ctx.FoundFlag) == 0 {
-				fmt.Printf("\nWORKER DISCONNECTED (WorkerID: %s) - worker exited\n", shortID)
+				fmt.Printf("\nWORKER DISCONNECTED (WorkerID: %s) - worker exited\n", workerID)
 				ctx.WorkersMu.Lock()
 				activeCount := len(ctx.Workers)
 				ctx.WorkersMu.Unlock()
@@ -448,7 +456,7 @@ func handleWorker(ctx *Context, conn net.Conn) {
 			return
 
 		default:
-			fmt.Printf("  Received unexpected message from worker %s: %s\n", shortID, typ)
+			fmt.Printf("  Received unexpected message from worker %s: %s\n", workerID, typ)
 		}
 	}
 }
@@ -501,7 +509,7 @@ func register_worker(ctx *Context, conn net.Conn, addr string) (*WorkerInfo, err
 
 // send_chunk assigns the next available portion of the search space to a
 // requesting worker, or sends STOP if the password has already been found.
-func send_chunk(ctx *Context, worker *WorkerInfo, shortID string) {
+func send_chunk(ctx *Context, worker *WorkerInfo, workerID string) {
 	// If password already found, tell this worker to stop
 	if atomic.LoadInt32(&ctx.FoundFlag) == 1 {
 		_ = sendMsg(worker.Conn, map[string]any{"type": "stop"})
@@ -554,7 +562,7 @@ func send_chunk(ctx *Context, worker *WorkerInfo, shortID string) {
 		delete(ctx.Workers, worker.ID)
 		ctx.WorkersMu.Unlock()
 		_ = worker.Conn.Close()
-		fmt.Printf("\nWORKER DISCONNECTED (WorkerID: %s) - failed to send job\n", shortID)
+		fmt.Printf("\nWORKER DISCONNECTED (WorkerID: %s) - failed to send job\n", workerID)
 		return
 	}
 
@@ -564,7 +572,7 @@ func send_chunk(ctx *Context, worker *WorkerInfo, shortID string) {
 		delete(ctx.Workers, worker.ID)
 		ctx.WorkersMu.Unlock()
 		_ = worker.Conn.Close()
-		fmt.Printf("\nWORKER DISCONNECTED (WorkerID: %s) - no job ack\n", shortID)
+		fmt.Printf("\nWORKER DISCONNECTED (WorkerID: %s) - no job ack\n", workerID)
 		return
 	}
 
@@ -575,16 +583,16 @@ func send_chunk(ctx *Context, worker *WorkerInfo, shortID string) {
 	ackType := strFromAny(ack["type"])
 	ackJobID := intFromAny(ack["job_id"])
 	if ackType != "job_ack" || ackJobID != jobID {
-		fmt.Printf("  WARNING: Unexpected ack from worker %s: %v\n", shortID, ack)
+		fmt.Printf("  WARNING: Unexpected ack from worker %s: %v\n", workerID, ack)
 	}
 
-	fmt.Printf("\nDISPATCHED JOB #%d (WorkerID: %s)\n", jobID, shortID)
+	fmt.Printf("\nDISPATCHED JOB #%d (WorkerID: %s)\n", jobID, workerID)
 	fmt.Printf("  Chunk: %d to %d\n", chunkStart, chunkStart+int64(chunkSize))
 	fmt.Printf("  Dispatch Latency: %.2f milliseconds (C -> W)\n", lat*1000)
 }
 
 // report_result displays the overall cracking summary once the password is found.
-func report_result(ctx *Context, shortID string, msg map[string]any) {
+func report_result(ctx *Context, workerID string, msg map[string]any) {
 	passwordValue, _ := msg["password"].(string)
 
 	totalAttempts := atomic.LoadInt64(&ctx.TotalAttempts)
@@ -637,7 +645,7 @@ func report_result(ctx *Context, shortID string, msg map[string]any) {
 	fmt.Printf("PARSING TIME: %.2f milliseconds\n", parseMs)
 	fmt.Printf("DISPATCH LATENCY (AVG): %.2f milliseconds\n", avgDispatchMs)
 	fmt.Printf("RESULT LATENCY (AVG): %.2f milliseconds\n", avgResultMs)
-	fmt.Printf("CRACKED BY: Worker #%s in Job #%d\n", shortID, intFromAny(msg["job_id"]))
+	fmt.Printf("CRACKED BY: Worker #%s in Job #%d\n", workerID, intFromAny(msg["job_id"]))
 	fmt.Println(strings.Repeat("=", boxWidth))
 }
 

@@ -69,6 +69,11 @@ type Context struct {
 	InterruptedCrack int32
 	ForceStop        int32
 	CurrentState     int32
+
+	TotalAttempts int64     // atomic, accumulated across all jobs
+	hbOnce        sync.Once // ensures heartbeat goroutine starts exactly once
+	hbStopOnce    sync.Once // ensures HBDone is closed exactly once
+	HBDone        chan struct{}
 }
 
 type Handler func(*Context) State
@@ -217,6 +222,12 @@ func request_job(ctx *Context) State {
 		return StateError
 	}
 
+	hbInterval := intFromAny(job["hb_interval"])
+	ctx.hbOnce.Do(func() {
+		startHeartbeat(ctx, hbInterval)
+		fmt.Printf("  Heartbeat started (interval: %ds)\n", hbInterval)
+	})
+
 	ctx.JobData = job
 	fmt.Printf("  Job #%d received from controller -> (Chunk: %d to %d)\n",
 		intFromAny(job["job_id"]),
@@ -227,65 +238,19 @@ func request_job(ctx *Context) State {
 	return StateCrack
 }
 
-func crack(ctx *Context) State {
-	//time.Sleep(10 * time.Second) // Test HB Protocol
-
-	job := ctx.JobData
-	threads := ctx.Settings.Threads
-
-	targetHash := strFromAny(job["hash_full"])
-	charset := strFromAny(job["charset"])
-	alg_id := strFromAny(job["alg_id"])
-
-	hbInterval := intFromAny(job["hb_interval"])
+func startHeartbeat(ctx *Context, hbInterval int) {
 	hbDur := time.Duration(hbInterval) * time.Second
-
-	chunkStart := int64FromAny(job["chunk_start"])
-	chunkEnd := chunkStart + int64(intFromAny(job["chunk_size"]))
-
-	fmt.Printf("\nJOB #%d STARTED\n", intFromAny(job["job_id"]))
-	fmt.Printf("  Cracking passwords %d to %d in this chunk with %d threads...\n", chunkStart, chunkEnd, threads)
-
-	startTime := time.Now()
-
-	jobs := make(chan string, 1<<12)
-	var foundFlag int32 = 0
-	var totalAttempts int64 = 0
-	var wg sync.WaitGroup
-	var foundMu sync.Mutex
-	var foundPassword string
-	statusMessage := "Search Exhausted"
-
-	// Handle manual interruption
 	go func() {
-		for {
-			if atomic.LoadInt32(&ctx.InterruptedCrack) == 1 {
-				atomic.StoreInt32(&foundFlag, 1)
-				foundMu.Lock()
-				statusMessage = "Manually Interrupted"
-				foundMu.Unlock()
-				return
-			}
-			time.Sleep(50 * time.Millisecond)
-		}
-	}()
-
-	// Handles heartbeats
-	hbDone := make(chan struct{})
-	var hbWG sync.WaitGroup
-	hbWG.Add(1)
-	go func() {
-		defer hbWG.Done()
 		var lastReported int64 = 0
 		lastTime := time.Now()
 		ticker := time.NewTicker(hbDur)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-hbDone:
+			case <-ctx.HBDone:
 				return
 			case <-ticker.C:
-				total := atomic.LoadInt64(&totalAttempts)
+				total := atomic.LoadInt64(&ctx.TotalAttempts)
 				delta := total - lastReported
 				now := time.Now()
 				elapsed := now.Sub(lastTime).Seconds()
@@ -313,6 +278,47 @@ func crack(ctx *Context) State {
 				lastTime = now
 				fmt.Printf("  Sent heartbeat response (%s)\n", timestamp)
 			}
+		}
+	}()
+}
+
+func crack(ctx *Context) State {
+	//time.Sleep(10 * time.Second) // Test HB Protocol
+
+	job := ctx.JobData
+	threads := ctx.Settings.Threads
+
+	targetHash := strFromAny(job["hash_full"])
+	charset := strFromAny(job["charset"])
+	alg_id := strFromAny(job["alg_id"])
+
+	chunkStart := int64FromAny(job["chunk_start"])
+	chunkEnd := chunkStart + int64(intFromAny(job["chunk_size"]))
+
+	fmt.Printf("\nJOB #%d STARTED\n", intFromAny(job["job_id"]))
+	fmt.Printf("  Cracking passwords %d to %d in this chunk with %d threads...\n", chunkStart, chunkEnd, threads)
+
+	startTime := time.Now()
+
+	jobs := make(chan string, 1<<12)
+	var foundFlag int32 = 0
+	var jobAttempts int64 = 0
+	var wg sync.WaitGroup
+	var foundMu sync.Mutex
+	var foundPassword string
+	statusMessage := "Search Exhausted"
+
+	// Handle manual interruption
+	go func() {
+		for {
+			if atomic.LoadInt32(&ctx.InterruptedCrack) == 1 {
+				atomic.StoreInt32(&foundFlag, 1)
+				foundMu.Lock()
+				statusMessage = "Manually Interrupted"
+				foundMu.Unlock()
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
 		}
 	}()
 
@@ -403,7 +409,8 @@ func crack(ctx *Context) State {
 			}
 			// Count attempts
 			localAttempts++
-			atomic.AddInt64(&totalAttempts, 1)
+			atomic.AddInt64(&jobAttempts, 1)
+			atomic.AddInt64(&ctx.TotalAttempts, 1)
 			// Check the password and declare if found
 			if verifyCandidate(candidate) {
 				if atomic.CompareAndSwapInt32(&foundFlag, 0, 1) {
@@ -428,8 +435,6 @@ func crack(ctx *Context) State {
 		go worker(i)
 	}
 	wg.Wait()        // Wait for workers to finish
-	close(hbDone)    // Stop heartbeats
-	hbWG.Wait()      // Wait for heartbeat routine to exit
 	close(fsStopCh)  // Stop force stop listener
 	fsWG.Wait()      // Wait for force stop listener to exit
 
@@ -454,11 +459,11 @@ func crack(ctx *Context) State {
 			return "N/A"
 		}(),
 		"compute_time": endTime.Sub(startTime).Seconds(),
-		"attempts":     int(atomic.LoadInt64(&totalAttempts)),
+		"attempts":     int(atomic.LoadInt64(&jobAttempts)),
 		"status":       final_status,
 	}
 
-	fmt.Printf("  Cracking has completed for this chunk after %d attempts\n", atomic.LoadInt64(&totalAttempts))
+	fmt.Printf("  Cracking has completed for this chunk after %d attempts\n", atomic.LoadInt64(&jobAttempts))
 
 	if atomic.LoadInt32(&ctx.ForceStop) == 1 {
 		fmt.Printf("\nSTOP: PASSWORD FOUND\n")
@@ -546,6 +551,9 @@ func error_state(ctx *Context) State {
 }
 
 func cleanup(ctx *Context) State {
+	ctx.hbStopOnce.Do(func() {
+		close(ctx.HBDone)
+	})
 	if ctx.Controller != nil {
 		_ = ctx.Controller.Close()
 	}
@@ -557,7 +565,9 @@ func cleanup(ctx *Context) State {
 func main() {
 	fmt.Println("--- WORKER ---")
 
-	ctx := &Context{}
+	ctx := &Context{
+		HBDone: make(chan struct{}),
+	}
 
 	handlers := map[State]Handler{
 		StateParseArgs:     parse_arguments,
