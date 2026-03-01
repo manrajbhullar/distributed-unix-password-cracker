@@ -88,6 +88,7 @@ type Context struct {
 
 	DispatchLatencies []float64
 	ResultLatencies   []float64
+	ComputeTimes      []float64
 
 	Done chan struct{}
 
@@ -417,6 +418,7 @@ func handleWorker(ctx *Context, conn net.Conn) {
 				ctx.DispatchLatencies = append(ctx.DispatchLatencies, *worker.DispatchLatency)
 			}
 			ctx.ResultLatencies = append(ctx.ResultLatencies, rrl)
+			ctx.ComputeTimes = append(ctx.ComputeTimes, crackTime)
 			ctx.WorkersMu.Unlock()
 			fmt.Printf("\nJOB #%d COMPLETE (WorkerID: %s)\n", worker.CurrentJobID, workerID)
 			fmt.Printf("  Status: %s\n", strFromAny(msg["status"]))
@@ -467,7 +469,6 @@ func handleWorker(ctx *Context, conn net.Conn) {
 		case "force_stop_ack":
 			attempts := floatFromAny(msg["attempts"])
 			atomic.AddInt64(&ctx.TotalAttempts, int64(attempts))
-			fmt.Printf("\nFORCE STOP ACK (WorkerID: %s)\n  Partial Attempts: %.0f\n", workerID, attempts)
 
 		default:
 			fmt.Printf("  Received unexpected message from worker %s: %s\n", workerID, typ)
@@ -638,11 +639,6 @@ func report_result(ctx *Context) {
 		e2e = time.Since(*ctx.CrackStartTime).Seconds()
 	}
 
-	overallHps := 0.0
-	if e2e > 0 {
-		overallHps = float64(totalAttempts) / e2e
-	}
-
 	parseMs := 0.0
 	if ctx.ParseTime != nil {
 		parseMs = (*ctx.ParseTime) * 1000
@@ -650,6 +646,7 @@ func report_result(ctx *Context) {
 
 	avgDispatchMs := 0.0
 	avgResultMs := 0.0
+	totalComputeS := 0.0
 	ctx.WorkersMu.Lock()
 	if len(ctx.DispatchLatencies) > 0 {
 		sum := 0.0
@@ -665,7 +662,17 @@ func report_result(ctx *Context) {
 		}
 		avgResultMs = (sum / float64(len(ctx.ResultLatencies))) * 1000
 	}
+	if len(ctx.ComputeTimes) > 0 {
+		for _, v := range ctx.ComputeTimes {
+			totalComputeS += v
+		}
+	}
 	ctx.WorkersMu.Unlock()
+
+	overallHps := 0.0
+	if totalComputeS > 0 {
+		overallHps = float64(totalAttempts) / totalComputeS
+	}
 
 	const boxWidth = 45
 	title := "CRACKING RESULTS"
@@ -676,6 +683,7 @@ func report_result(ctx *Context) {
 	fmt.Printf("STATUS: SUCCESS\n")
 	fmt.Printf("PASSWORD: %s\n", passwordValue)
 	fmt.Printf("TOTAL ATTEMPTS: %d\n", totalAttempts)
+	fmt.Printf("COMPUTE TIME: %.2f seconds\n", totalComputeS)
 	fmt.Printf("E2E RUNTIME: %.2f seconds\n", e2e)
 	fmt.Printf("OVERALL SPEED: %.2f hashes/sec\n", overallHps)
 	fmt.Printf("PARSING TIME: %.2f milliseconds\n", parseMs)
