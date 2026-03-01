@@ -467,6 +467,12 @@ func crack(ctx *Context) State {
 
 	if atomic.LoadInt32(&ctx.ForceStop) == 1 {
 		fmt.Printf("\nSTOP: PASSWORD FOUND\n")
+		ctx.sendMu.Lock()
+		_ = sendMsg(ctx.Controller, map[string]any{
+			"type":     "force_stop_ack",
+			"attempts": int(atomic.LoadInt64(&jobAttempts)),
+		})
+		ctx.sendMu.Unlock()
 		return StateCleanup
 	}
 
