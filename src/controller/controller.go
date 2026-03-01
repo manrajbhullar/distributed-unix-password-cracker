@@ -334,17 +334,17 @@ func handleWorker(ctx *Context, conn net.Conn) {
 		msg, err := recvMsg(conn)
 		_ = conn.SetReadDeadline(time.Time{})
 		if err != nil {
-			netErr, ok := err.(net.Error)
-			if ok && netErr.Timeout() {
-				fmt.Printf("\nWORKER TIMEOUT (WorkerID: %s) - missed heartbeat\n", workerID)
-			} else {
-				fmt.Printf("\nWORKER DISCONNECTED (WorkerID: %s) - connection lost\n", workerID)
-			}
 			ctx.WorkersMu.Lock()
 			delete(ctx.Workers, worker.ID)
 			ctx.WorkersMu.Unlock()
 			_ = conn.Close()
 			if atomic.LoadInt32(&ctx.FoundFlag) == 0 {
+				netErr, ok := err.(net.Error)
+				if ok && netErr.Timeout() {
+					fmt.Printf("\nWORKER TIMEOUT (WorkerID: %s) - missed heartbeat\n", workerID)
+				} else {
+					fmt.Printf("\nWORKER DISCONNECTED (WorkerID: %s) - connection lost\n", workerID)
+				}
 				ctx.WorkersMu.Lock()
 				activeCount := len(ctx.Workers)
 				ctx.WorkersMu.Unlock()
@@ -562,18 +562,40 @@ func send_chunk(ctx *Context, worker *WorkerInfo, workerID string) {
 		delete(ctx.Workers, worker.ID)
 		ctx.WorkersMu.Unlock()
 		_ = worker.Conn.Close()
-		fmt.Printf("\nWORKER DISCONNECTED (WorkerID: %s) - failed to send job\n", workerID)
+		if atomic.LoadInt32(&ctx.FoundFlag) == 0 {
+			fmt.Printf("\nWORKER DISCONNECTED (WorkerID: %s) - failed to send job\n", workerID)
+		}
 		return
 	}
 
-	ack, err := recvMsg(worker.Conn)
-	if err != nil {
-		ctx.WorkersMu.Lock()
-		delete(ctx.Workers, worker.ID)
-		ctx.WorkersMu.Unlock()
-		_ = worker.Conn.Close()
-		fmt.Printf("\nWORKER DISCONNECTED (WorkerID: %s) - no job ack\n", workerID)
-		return
+	var ack map[string]any
+	for {
+		msg, err := recvMsg(worker.Conn)
+		if err != nil {
+			ctx.WorkersMu.Lock()
+			delete(ctx.Workers, worker.ID)
+			ctx.WorkersMu.Unlock()
+			_ = worker.Conn.Close()
+			if atomic.LoadInt32(&ctx.FoundFlag) == 0 {
+				fmt.Printf("\nWORKER DISCONNECTED (WorkerID: %s) - no job ack\n", workerID)
+			}
+			return
+		}
+		if strFromAny(msg["type"]) == "heartbeat_resp" {
+			delta := floatFromAny(msg["delta_tested"])
+			total := floatFromAny(msg["total_tested"])
+			threadsActive := intFromAny(msg["threads_active"])
+			rate := floatFromAny(msg["current_rate"])
+			fmt.Printf("\nHEARTBEAT (WorkerID: %s)\n", workerID)
+			fmt.Printf("  Delta Tested: %.0f\n", delta)
+			fmt.Printf("  Total Attempts: %.0f\n", total)
+			fmt.Printf("  Threads Active: %d\n", threadsActive)
+			fmt.Printf("  Current Rate: %.2f hashes/sec\n", rate)
+			fmt.Printf("  Current Job: %d\n", worker.CurrentJobID)
+			continue
+		}
+		ack = msg
+		break
 	}
 
 	dispatchEnd := time.Now()
