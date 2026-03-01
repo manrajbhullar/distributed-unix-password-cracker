@@ -489,18 +489,27 @@ func send_job_result(ctx *Context) State {
 
 	send_result_start := time.Now()
 	ctx.sendMu.Lock()
-	_ = sendMsg(ctx.Controller, result_msg)
+	err := sendMsg(ctx.Controller, result_msg)
 	ctx.sendMu.Unlock()
-
-	ack, err := recvMsg(ctx.Controller)
 	if err != nil {
-		ctx.ExitMessage = "ERROR: Failed to send results to controller"
-		return StateError
+		return StateCleanup
 	}
 
-	if strFromAny(ack["type"]) != "result_ack" {
-		ctx.ExitMessage = fmt.Sprintf("ERROR: Expected result_ack, got: %v", ack)
-		return StateError
+	var ack map[string]any
+	for {
+		ack, err = recvMsg(ctx.Controller)
+		if err != nil {
+			return StateCleanup
+		}
+		if strFromAny(ack["type"]) == "force_stop" {
+			atomic.StoreInt32(&ctx.ForceStop, 1)
+			return StateCleanup
+		}
+		if strFromAny(ack["type"]) == "result_ack" {
+			break
+		}
+		// Any other unexpected message: clean up silently
+		return StateCleanup
 	}
 
 	lat := time.Since(send_result_start).Seconds()
