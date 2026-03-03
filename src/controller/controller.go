@@ -75,15 +75,15 @@ type Context struct {
 	NextWorkerID int
 
 	NextChunkStart int64
-	FoundFlag      int32 // atomic
+	FoundFlag      int32
 	FoundPassword  string
 	FoundByWorker  string
 	FoundByJobID   int
 	FoundTime      time.Time
 
-	WorkerWG sync.WaitGroup // counts active handleWorker goroutines
+	WorkerWG sync.WaitGroup
 
-	TotalAttempts  int64 // atomic, accumulated across all chunks
+	TotalAttempts  int64
 	CrackStartTime *time.Time
 
 	DispatchLatencies []float64
@@ -205,7 +205,6 @@ func parse_shadow(ctx *Context) State {
 			continue
 		}
 
-		// Unusable hash
 		if password == "" || password == "!" || password == "*" || password == "!!" {
 			ctx.ExitMessage = fmt.Sprintf("ERROR: User '%s' has no usable hash", username)
 			return StateError
@@ -248,8 +247,6 @@ func parse_shadow(ctx *Context) State {
 			ctx.PwInfo.Hash = combined[22:]
 
 		} else {
-			// sha256/sha512: either $5$rounds=N$salt$hash (5 tokens)
-			// or $5$salt$hash (4 tokens, default rounds)
 			if strings.HasPrefix(tokens[2], "rounds=") {
 				if len(tokens) < 5 {
 					ctx.ExitMessage = "ERROR: User hash failed to tokenize"
@@ -300,12 +297,11 @@ func listen(ctx *Context) State {
 	ctx.ServerLn = ln
 	fmt.Printf("\nWAITING TO REGISTER WORKERS (Active: 0)\n")
 
-	// Accept loop — continuously accepts new worker connections
 	go func() {
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
-				return // Listener closed during cleanup
+				return
 			}
 			ctx.WorkerWG.Add(1)
 			go func() {
@@ -318,14 +314,10 @@ func listen(ctx *Context) State {
 	return StateMonitorProgress
 }
 
-// handleWorker manages one worker connection lifecycle.
-// Calls register_worker, then loops reading messages and
-// calls send_chunk to dispatch jobs.
 func handleWorker(ctx *Context, conn net.Conn) {
 	addr := conn.RemoteAddr().String()
 	fmt.Printf("\nWORKER CONNECTED FROM: %s\n", addr)
 
-	// Register the worker
 	worker, err := register_worker(ctx, conn, addr)
 	if err != nil {
 		fmt.Printf("  ERROR: Worker from %s failed to register. %v\n", addr, err)
@@ -336,7 +328,6 @@ func handleWorker(ctx *Context, conn net.Conn) {
 	workerID := worker.ID
 	hbTimeout := time.Duration(ctx.Settings.HeartbeatInterval)*time.Second + 500*time.Millisecond
 
-	// Per-worker message loop
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(hbTimeout))
 		msg, err := recvMsg(conn)
@@ -430,21 +421,18 @@ func handleWorker(ctx *Context, conn net.Conn) {
 			fmt.Printf("  Result Latency: %.2f ms\n", resultMs)
 
 			if found {
-				// First worker to find the password wins
 				if atomic.CompareAndSwapInt32(&ctx.FoundFlag, 0, 1) {
 					ctx.WorkersMu.Lock()
 					ctx.FoundPassword, _ = msg["password"].(string)
 					ctx.FoundByWorker = worker.ID
 					ctx.FoundByJobID = intFromAny(msg["job_id"])
 					ctx.FoundTime = time.Now()
-					// Broadcast force_stop to all other active workers immediately
 					for id, w := range ctx.Workers {
 						if id != worker.ID {
 							_ = sendMsg(w.Conn, map[string]any{"type": "force_stop"})
 						}
 					}
 					ctx.WorkersMu.Unlock()
-					// Stop accepting new connections so WorkerWG can drain cleanly
 					_ = ctx.ServerLn.Close()
 					close(ctx.Done)
 				}
@@ -476,8 +464,6 @@ func handleWorker(ctx *Context, conn net.Conn) {
 	}
 }
 
-// register_worker accepts and records a worker registration so it can
-// participate in cracking.
 func register_worker(ctx *Context, conn net.Conn, addr string) (*WorkerInfo, error) {
 	fmt.Println("  Waiting for worker to send registration request...")
 
@@ -522,10 +508,7 @@ func register_worker(ctx *Context, conn net.Conn, addr string) (*WorkerInfo, err
 	return worker, nil
 }
 
-// send_chunk assigns the next available portion of the search space to a
-// requesting worker, or sends STOP if the password has already been found.
 func send_chunk(ctx *Context, worker *WorkerInfo, workerID string) {
-	// If password already found, tell this worker to stop
 	if atomic.LoadInt32(&ctx.FoundFlag) == 1 {
 		_ = sendMsg(worker.Conn, map[string]any{"type": "stop"})
 		return
@@ -628,7 +611,6 @@ func send_chunk(ctx *Context, worker *WorkerInfo, workerID string) {
 	fmt.Printf("  Dispatch Latency: %.2f milliseconds (C -> W)\n", lat*1000)
 }
 
-// report_result displays the overall cracking summary once the password is found.
 func report_result(ctx *Context) {
 	passwordValue := ctx.FoundPassword
 
@@ -693,12 +675,8 @@ func report_result(ctx *Context) {
 	fmt.Println(strings.Repeat("=", boxWidth))
 }
 
-// monitor_progress tracks all active workers and receives updates.
-// Blocks until a worker finds the password or SIGINT/SIGTERM triggers cleanup.
 func monitor_progress(ctx *Context) State {
 	<-ctx.Done
-	// Wait for all handleWorker goroutines to finish so their force_stop_ack
-	// partial attempt counts are fully accumulated before reporting results.
 	waitCh := make(chan struct{})
 	go func() { ctx.WorkerWG.Wait(); close(waitCh) }()
 	select {

@@ -70,9 +70,9 @@ type Context struct {
 	ForceStop        int32
 	CurrentState     int32
 
-	TotalAttempts int64     // atomic, accumulated across all jobs
-	hbOnce        sync.Once // ensures heartbeat goroutine starts exactly once
-	hbStopOnce    sync.Once // ensures HBDone is closed exactly once
+	TotalAttempts int64
+	hbOnce        sync.Once
+	hbStopOnce    sync.Once
 	HBDone        chan struct{}
 }
 
@@ -139,7 +139,6 @@ func connect(ctx *Context) State {
 	host := ctx.Settings.ControllerHost
 	port := ctx.Settings.ControllerPort
 
-	//conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", host, port))
 	conn, err := net.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
 	if err != nil {
 		ctx.ExitMessage = fmt.Sprintf("ERROR: Connection attempt failed. %v", err)
@@ -283,8 +282,6 @@ func startHeartbeat(ctx *Context, hbInterval int) {
 }
 
 func crack(ctx *Context) State {
-	//time.Sleep(10 * time.Second) // Test HB Protocol
-
 	job := ctx.JobData
 	threads := ctx.Settings.Threads
 
@@ -308,7 +305,6 @@ func crack(ctx *Context) State {
 	var foundPassword string
 	statusMessage := "Search Exhausted"
 
-	// Handle manual interruption
 	go func() {
 		for {
 			if atomic.LoadInt32(&ctx.InterruptedCrack) == 1 {
@@ -322,7 +318,6 @@ func crack(ctx *Context) State {
 		}
 	}()
 
-	// Force stop listener — controller pushes this when another worker finds the password
 	fsStopCh := make(chan struct{})
 	var fsWG sync.WaitGroup
 	fsWG.Add(1)
@@ -349,7 +344,6 @@ func crack(ctx *Context) State {
 		}
 	}()
 
-	// Candidate generator — bounded to the assigned chunk
 	generator := func() {
 		defer close(jobs)
 		for i := chunkStart; i < chunkEnd; i++ {
@@ -372,7 +366,6 @@ func crack(ctx *Context) State {
 		}
 	}
 
-	// Verifies according to algorithm type
 	verifyCandidate := func(candidate string) bool {
 		switch alg_id {
 		case "1":
@@ -397,21 +390,17 @@ func crack(ctx *Context) State {
 		}
 	}
 
-	// Consumes candidates and checks if there is a match
 	worker := func(id int) {
 		_ = id
 		defer wg.Done()
 		localAttempts := 0
 		for candidate := range jobs {
-			// Quit if found or interrupted
 			if atomic.LoadInt32(&foundFlag) != 0 {
 				return
 			}
-			// Count attempts
 			localAttempts++
 			atomic.AddInt64(&jobAttempts, 1)
 			atomic.AddInt64(&ctx.TotalAttempts, 1)
-			// Check the password and declare if found
 			if verifyCandidate(candidate) {
 				if atomic.CompareAndSwapInt32(&foundFlag, 0, 1) {
 					foundMu.Lock()
@@ -420,27 +409,24 @@ func crack(ctx *Context) State {
 				}
 				return
 			}
-			// Exit if another worker found it
 			if atomic.LoadInt32(&foundFlag) != 0 {
 				return
 			}
 		}
 	}
 
-	runtime.GOMAXPROCS(threads) // Limit Go runtime to the requested amount OS threads
-	go generator()              // Start generator
-	// Spawn worker threads
+	runtime.GOMAXPROCS(threads)
+	go generator()
 	wg.Add(threads)
 	for i := 0; i < threads; i++ {
 		go worker(i)
 	}
-	wg.Wait()        // Wait for workers to finish
-	close(fsStopCh)  // Stop force stop listener
-	fsWG.Wait()      // Wait for force stop listener to exit
+	wg.Wait()
+	close(fsStopCh)
+	fsWG.Wait()
 
-	endTime := time.Now() // End cracking timer
+	endTime := time.Now()
 
-	// Final status
 	finalFound := ""
 	foundMu.Lock()
 	finalFound = foundPassword
@@ -514,7 +500,6 @@ func send_job_result(ctx *Context) State {
 		if strFromAny(ack["type"]) == "result_ack" {
 			break
 		}
-		// Any other unexpected message: clean up silently
 		return StateCleanup
 	}
 
@@ -535,7 +520,6 @@ func send_job_result(ctx *Context) State {
 	fmt.Printf("  Result Return Latency: %.2f milliseconds (W -> C)\n", lat*1000)
 
 	if found || atomic.LoadInt32(&ctx.InterruptedCrack) == 1 {
-		// Password found or user interrupted — notify controller and exit
 		ctx.sendMu.Lock()
 		_ = sendMsg(ctx.Controller, map[string]any{
 			"type":      "disconnect",
@@ -545,7 +529,6 @@ func send_job_result(ctx *Context) State {
 		return StateCleanup
 	}
 
-	// Chunk exhausted but not found — request another chunk
 	return StateRequestJob
 }
 
@@ -701,8 +684,6 @@ func int64FromAny(v any) int64 {
 	}
 }
 
-// indexToCandidate converts a flat global index into a password string.
-// The index space is: 0..(base-1) for length-1, base..(base+base²-1) for length-2, etc.
 func indexToCandidate(index int64, charset string) string {
 	base := int64(len(charset))
 	length := 1
