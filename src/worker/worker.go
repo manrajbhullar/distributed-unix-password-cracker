@@ -71,9 +71,7 @@ type Context struct {
 	CurrentState     int32
 
 	TotalAttempts int64
-	hbOnce        sync.Once
-	hbStopOnce    sync.Once
-	HBDone        chan struct{}
+	IncomingMsgs  chan map[string]any
 }
 
 type Handler func(*Context) State
@@ -184,11 +182,14 @@ func register(ctx *Context) State {
 		strFromAny(resp["username"]),
 		strFromAny(resp["alg_id"]),
 	)
+	time.Sleep(time.Second * 10)
+	startMessageReader(ctx)
 	return StateRequestJob
 }
 
 func request_job(ctx *Context) State {
 	fmt.Printf("\nREADY FOR JOB\n")
+	//time.Sleep(10 * time.Second)
 	fmt.Println("  Requesting job from controller...")
 
 	req := map[string]any{
@@ -200,9 +201,9 @@ func request_job(ctx *Context) State {
 		return StateError
 	}
 
-	job, err := recvMsg(ctx.Controller)
-	if err != nil {
-		ctx.ExitMessage = fmt.Sprintf("ERROR: Receiving job failed. %v", err)
+	job, ok := <-ctx.IncomingMsgs
+	if !ok {
+		ctx.ExitMessage = "ERROR: Connection to controller lost"
 		return StateError
 	}
 
@@ -214,18 +215,14 @@ func request_job(ctx *Context) State {
 		"type":   "job_ack",
 		"job_id": job["job_id"],
 	}
+	ctx.sendMu.Lock()
 	_ = sendMsg(ctx.Controller, ack)
+	ctx.sendMu.Unlock()
 
 	if strFromAny(job["type"]) != "job" {
 		ctx.ExitMessage = fmt.Sprintf("ERROR: Unexpected message type: %v", job["type"])
 		return StateError
 	}
-
-	hbInterval := intFromAny(job["hb_interval"])
-	ctx.hbOnce.Do(func() {
-		startHeartbeat(ctx, hbInterval)
-		fmt.Printf("  Heartbeat started (interval: %ds)\n", hbInterval)
-	})
 
 	ctx.JobData = job
 	fmt.Printf("  Job #%d received from controller -> (Chunk: %d to %d)\n",
@@ -237,46 +234,43 @@ func request_job(ctx *Context) State {
 	return StateCrack
 }
 
-func startHeartbeat(ctx *Context, hbInterval int) {
-	hbDur := time.Duration(hbInterval) * time.Second
+func startMessageReader(ctx *Context) {
+	ctx.IncomingMsgs = make(chan map[string]any, 16)
 	go func() {
-		var lastReported int64 = 0
-		lastTime := time.Now()
-		ticker := time.NewTicker(hbDur)
-		defer ticker.Stop()
+		var lastHBAttempts int64
+		lastHBTime := time.Now()
 		for {
-			select {
-			case <-ctx.HBDone:
+			msg, err := recvMsg(ctx.Controller)
+			if err != nil {
+				close(ctx.IncomingMsgs)
 				return
-			case <-ticker.C:
+			}
+			if strFromAny(msg["type"]) == "heartbeat_req" {
 				total := atomic.LoadInt64(&ctx.TotalAttempts)
-				delta := total - lastReported
+				delta := total - lastHBAttempts
 				now := time.Now()
-				elapsed := now.Sub(lastTime).Seconds()
+				elapsed := now.Sub(lastHBTime).Seconds()
 				rate := 0.0
 				if elapsed > 0 {
 					rate = float64(delta) / elapsed
 				}
-				timestamp := time.Now().Format("15:04:05")
-				hb := map[string]any{
+				lastHBAttempts = total
+				lastHBTime = now
+				resp := map[string]any{
 					"type":           "heartbeat_resp",
 					"delta_tested":   delta,
 					"total_tested":   total,
 					"threads_active": ctx.Settings.Threads,
 					"current_rate":   rate,
-					"timestamp":      timestamp,
+					"timestamp":      now.Format("15:04:05"),
 				}
 				ctx.sendMu.Lock()
-				err := sendMsg(ctx.Controller, hb)
+				_ = sendMsg(ctx.Controller, resp)
 				ctx.sendMu.Unlock()
-				if err != nil {
-					fmt.Printf("  Connection to controller lost. Continuing cracking...\n")
-					return
-				}
-				lastReported = total
-				lastTime = now
-				fmt.Printf("  Sent heartbeat response (%s)\n", timestamp)
+				fmt.Printf("  Sent heartbeat response (%s)\n", now.Format("15:04:05"))
+				continue
 			}
+			ctx.IncomingMsgs <- msg
 		}
 	}()
 }
@@ -324,23 +318,19 @@ func crack(ctx *Context) State {
 	go func() {
 		defer fsWG.Done()
 		for {
-			_ = ctx.Controller.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
-			msg, err := recvMsg(ctx.Controller)
-			if err != nil {
-				select {
-				case <-fsStopCh:
-					_ = ctx.Controller.SetReadDeadline(time.Time{})
+			select {
+			case <-fsStopCh:
+				return
+			case msg, ok := <-ctx.IncomingMsgs:
+				if !ok {
 					return
-				default:
-					continue
 				}
+				if strFromAny(msg["type"]) == "force_stop" {
+					atomic.StoreInt32(&ctx.ForceStop, 1)
+					atomic.StoreInt32(&foundFlag, 1)
+				}
+				return
 			}
-			_ = ctx.Controller.SetReadDeadline(time.Time{})
-			if strFromAny(msg["type"]) == "force_stop" {
-				atomic.StoreInt32(&ctx.ForceStop, 1)
-				atomic.StoreInt32(&foundFlag, 1)
-			}
-			return
 		}
 	}()
 
@@ -487,17 +477,16 @@ func send_job_result(ctx *Context) State {
 		return StateCleanup
 	}
 
-	var ack map[string]any
 	for {
-		ack, err = recvMsg(ctx.Controller)
-		if err != nil {
+		msg, ok := <-ctx.IncomingMsgs
+		if !ok {
 			return StateCleanup
 		}
-		if strFromAny(ack["type"]) == "force_stop" {
+		if strFromAny(msg["type"]) == "force_stop" {
 			atomic.StoreInt32(&ctx.ForceStop, 1)
 			return StateCleanup
 		}
-		if strFromAny(ack["type"]) == "result_ack" {
+		if strFromAny(msg["type"]) == "result_ack" {
 			break
 		}
 		return StateCleanup
@@ -549,9 +538,6 @@ func error_state(ctx *Context) State {
 }
 
 func cleanup(ctx *Context) State {
-	ctx.hbStopOnce.Do(func() {
-		close(ctx.HBDone)
-	})
 	if ctx.Controller != nil {
 		_ = ctx.Controller.Close()
 	}
@@ -563,9 +549,7 @@ func cleanup(ctx *Context) State {
 func main() {
 	fmt.Println("--- WORKER ---")
 
-	ctx := &Context{
-		HBDone: make(chan struct{}),
-	}
+	ctx := &Context{}
 
 	handlers := map[State]Handler{
 		StateParseArgs:     parse_arguments,
