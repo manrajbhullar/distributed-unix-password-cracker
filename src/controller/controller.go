@@ -64,6 +64,12 @@ type WorkerInfo struct {
 	ResultReturnLatency *float64
 }
 
+type StoppedJob struct {
+	WorkerID string
+	JobID    int
+	Attempts int64
+}
+
 type Context struct {
 	Settings    Settings
 	ExitMessage string
@@ -82,7 +88,8 @@ type Context struct {
 	FoundPassword  string
 	FoundByWorker  string
 	FoundByJobID   int
-	FoundTime      time.Time
+	FoundTime time.Time
+	E2E       float64
 
 	WorkerWG sync.WaitGroup
 
@@ -91,7 +98,8 @@ type Context struct {
 
 	DispatchLatencies []float64
 	ResultLatencies   []float64
-	ComputeTimes      []float64
+	ComputeTimes map[string][]float64
+	StoppedJobs       []StoppedJob
 
 	Done chan struct{}
 
@@ -340,7 +348,12 @@ func handleWorker(ctx *Context, conn net.Conn) {
 		defer timer.Stop()
 		for {
 			select {
+			case <-ctx.Done:
+				return
 			case <-timer.C:
+				if atomic.LoadInt32(&ctx.FoundFlag) == 1 {
+					return
+				}
 				worker.SendMu.Lock()
 				err := sendMsg(conn, map[string]any{"type": "heartbeat_req"})
 				worker.SendMu.Unlock()
@@ -364,6 +377,8 @@ func handleWorker(ctx *Context, conn net.Conn) {
 							close(hbDead)
 							return
 						}
+					case <-ctx.Done:
+						return
 					case <-hbDone:
 						return
 					}
@@ -455,10 +470,7 @@ func handleWorker(ctx *Context, conn net.Conn) {
 				attempts := floatFromAny(msg["attempts"])
 				atomic.AddInt64(&ctx.TotalAttempts, int64(attempts))
 				crackTime := floatFromAny(msg["compute_time"])
-				hps := 0.0
-				if crackTime > 0 {
-					hps = attempts / crackTime
-				}
+				hps := floatFromAny(msg["hps"])
 				resultMs := 0.0
 				if worker.ResultReturnLatency != nil {
 					resultMs = (*worker.ResultReturnLatency) * 1000
@@ -472,13 +484,13 @@ func handleWorker(ctx *Context, conn net.Conn) {
 					ctx.DispatchLatencies = append(ctx.DispatchLatencies, *worker.DispatchLatency)
 				}
 				ctx.ResultLatencies = append(ctx.ResultLatencies, rrl)
-				ctx.ComputeTimes = append(ctx.ComputeTimes, crackTime)
+				ctx.ComputeTimes[workerID] = append(ctx.ComputeTimes[workerID], crackTime)
 				ctx.WorkersMu.Unlock()
 				fmt.Printf("\nJOB #%d COMPLETE (WorkerID: %s)\n", worker.CurrentJobID, workerID)
 				fmt.Printf("  Status: %s\n", strFromAny(msg["status"]))
 				fmt.Printf("  Chunk: %d to %d\n", worker.CurrentChunkStart, chunkEnd)
 				fmt.Printf("  Attempts: %.0f\n", attempts)
-				fmt.Printf("  Time: %.2f seconds\n", crackTime)
+				fmt.Printf("  Compute Time: %.2f seconds\n", crackTime)
 				fmt.Printf("  Speed: %.2f hashes/sec\n", hps)
 				fmt.Printf("  Dispatch Latency: %.2f ms\n", dispatchMs)
 				fmt.Printf("  Result Latency: %.2f ms\n", resultMs)
@@ -490,6 +502,7 @@ func handleWorker(ctx *Context, conn net.Conn) {
 						ctx.FoundByWorker = worker.ID
 						ctx.FoundByJobID = intFromAny(msg["job_id"])
 						ctx.FoundTime = time.Now()
+						ctx.E2E = ctx.FoundTime.Sub(*ctx.CrackStartTime).Seconds()
 						for id, w := range ctx.Workers {
 							if id != worker.ID {
 								w.SendMu.Lock()
@@ -520,11 +533,46 @@ func handleWorker(ctx *Context, conn net.Conn) {
 				return
 
 			case "force_stop_ack":
-				attempts := floatFromAny(msg["attempts"])
-				atomic.AddInt64(&ctx.TotalAttempts, int64(attempts))
+				attempts := int64(floatFromAny(msg["attempts"]))
+				atomic.AddInt64(&ctx.TotalAttempts, attempts)
+				ctx.WorkersMu.Lock()
+				ctx.StoppedJobs = append(ctx.StoppedJobs, StoppedJob{
+					WorkerID: workerID,
+					JobID:    worker.CurrentJobID,
+					Attempts: attempts,
+				})
+				ctx.WorkersMu.Unlock()
 
 			default:
 				fmt.Printf("  Received unexpected message from worker %s: %s\n", workerID, typ)
+			}
+
+		case <-ctx.Done:
+			if worker.ID == ctx.FoundByWorker {
+				return
+			}
+			deadline := time.After(3 * time.Second)
+			for {
+				select {
+				case msg, ok := <-worker.IncomingMsgs:
+					if !ok {
+						return
+					}
+					if strFromAny(msg["type"]) == "force_stop_ack" {
+						attempts := int64(floatFromAny(msg["attempts"]))
+						atomic.AddInt64(&ctx.TotalAttempts, attempts)
+						ctx.WorkersMu.Lock()
+						ctx.StoppedJobs = append(ctx.StoppedJobs, StoppedJob{
+							WorkerID: workerID,
+							JobID:    worker.CurrentJobID,
+							Attempts: attempts,
+						})
+						ctx.WorkersMu.Unlock()
+						return
+					}
+				case <-deadline:
+					return
+				}
 			}
 
 		case <-hbDead:
@@ -738,10 +786,7 @@ func report_result(ctx *Context) {
 
 	totalAttempts := atomic.LoadInt64(&ctx.TotalAttempts)
 
-	e2e := 0.0
-	if ctx.CrackStartTime != nil {
-		e2e = time.Since(*ctx.CrackStartTime).Seconds()
-	}
+	e2e := ctx.E2E
 
 	parseMs := 0.0
 	if ctx.ParseTime != nil {
@@ -766,16 +811,27 @@ func report_result(ctx *Context) {
 		}
 		avgResultMs = (sum / float64(len(ctx.ResultLatencies))) * 1000
 	}
-	if len(ctx.ComputeTimes) > 0 {
-		for _, v := range ctx.ComputeTimes {
-			totalComputeS += v
+	for _, times := range ctx.ComputeTimes {
+		workerSum := 0.0
+		for _, v := range times {
+			workerSum += v
+		}
+		if workerSum > totalComputeS {
+			totalComputeS = workerSum
 		}
 	}
 	ctx.WorkersMu.Unlock()
 
 	overallHps := 0.0
-	if totalComputeS > 0 {
-		overallHps = float64(totalAttempts) / totalComputeS
+	if e2e > 0 {
+		overallHps = float64(totalAttempts) / e2e
+	}
+
+	if len(ctx.StoppedJobs) > 0 {
+		fmt.Printf("\nJOBS STOPPED EARLY:\n")
+		for _, sj := range ctx.StoppedJobs {
+			fmt.Printf("  WorkerID: %s - %d attempts for Job #%d\n", sj.WorkerID, sj.Attempts, sj.JobID)
+		}
 	}
 
 	const boxWidth = 45
@@ -835,9 +891,10 @@ func main() {
 
 	ctx := &Context{
 		Workers:      make(map[string]*WorkerInfo),
-		NextJobID:    1,
-		NextWorkerID: 1,
-		Done:         make(chan struct{}),
+		ComputeTimes: make(map[string][]float64),
+		NextJobID:      1,
+		NextWorkerID:   1,
+		Done:           make(chan struct{}),
 	}
 
 	handlers := map[State]Handler{

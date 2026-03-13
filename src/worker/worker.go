@@ -182,7 +182,7 @@ func register(ctx *Context) State {
 		strFromAny(resp["username"]),
 		strFromAny(resp["alg_id"]),
 	)
-	time.Sleep(time.Second * 5)
+	//time.Sleep(time.Second * 5)
 	startMessageReader(ctx)
 	return StateRequestJob
 }
@@ -209,6 +209,18 @@ func request_job(ctx *Context) State {
 
 	if strFromAny(job["type"]) == "stop" {
 		return StateStopWorker
+	}
+
+	if strFromAny(job["type"]) == "force_stop" {
+		fmt.Printf("\nPASSWORD FOUND\n")
+		fmt.Printf("  No active job\n")
+		ctx.sendMu.Lock()
+		_ = sendMsg(ctx.Controller, map[string]any{
+			"type":     "force_stop_ack",
+			"attempts": 0,
+		})
+		ctx.sendMu.Unlock()
+		return StateCleanup
 	}
 
 	ack := map[string]any{
@@ -426,6 +438,13 @@ func crack(ctx *Context) State {
 	final_status := statusMessage
 	foundMu.Unlock()
 
+	computeTime := endTime.Sub(startTime).Seconds()
+	attempts := int(atomic.LoadInt64(&jobAttempts))
+	hps := 0.0
+	if computeTime > 0 {
+		hps = float64(attempts) / computeTime
+	}
+
 	job["result"] = map[string]any{
 		"found": finalFound != "",
 		"password": func() string {
@@ -434,15 +453,17 @@ func crack(ctx *Context) State {
 			}
 			return "N/A"
 		}(),
-		"compute_time": endTime.Sub(startTime).Seconds(),
-		"attempts":     int(atomic.LoadInt64(&jobAttempts)),
+		"compute_time": computeTime,
+		"attempts":     attempts,
+		"hps":          hps,
 		"status":       final_status,
 	}
-
+	fmt.Printf("  Compute Time: %.2f seconds\n", endTime.Sub(startTime).Seconds())
 	fmt.Printf("  Cracking has completed for this chunk after %d attempts\n", atomic.LoadInt64(&jobAttempts))
 
 	if atomic.LoadInt32(&ctx.ForceStop) == 1 {
-		fmt.Printf("\nSTOP: PASSWORD FOUND\n")
+		fmt.Printf("\nPASSWORD FOUND\n")
+		fmt.Printf("  Stopped after %d password attempts for Job #%d\n", atomic.LoadInt64(&jobAttempts), intFromAny(job["job_id"]))
 		ctx.sendMu.Lock()
 		_ = sendMsg(ctx.Controller, map[string]any{
 			"type":     "force_stop_ack",
@@ -466,6 +487,7 @@ func send_job_result(ctx *Context) State {
 		"password":     result["password"],
 		"attempts":     result["attempts"],
 		"compute_time": result["compute_time"],
+		"hps":          result["hps"],
 		"status":       result["status"],
 	}
 
