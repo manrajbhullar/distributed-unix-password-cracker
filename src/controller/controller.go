@@ -50,6 +50,7 @@ type WorkerInfo struct {
 	Conn         net.Conn
 	SendMu       sync.Mutex
 	IncomingMsgs chan map[string]any
+	HBAck        chan struct{}
 	ID           string
 	Addr         string
 	HasJob       bool
@@ -329,21 +330,30 @@ func handleWorker(ctx *Context, conn net.Conn) {
 
 	workerID := worker.ID
 	hbInterval := time.Duration(ctx.Settings.HeartbeatInterval) * time.Second
-	hbTimeout := hbInterval + 500*time.Millisecond
-	missedHB := 0
-	maxMissedHB := 3
 
 	hbDone := make(chan struct{})
+	worker.HBAck = make(chan struct{}, 1)
+	hbDead := make(chan struct{})
 	go func() {
-		ticker := time.NewTicker(hbInterval)
-		defer ticker.Stop()
+		timer := time.NewTimer(hbInterval)
+		defer timer.Stop()
 		for {
 			select {
-			case <-ticker.C:
+			case <-timer.C:
 				worker.SendMu.Lock()
 				err := sendMsg(conn, map[string]any{"type": "heartbeat_req"})
 				worker.SendMu.Unlock()
 				if err != nil {
+					return
+				}
+				// Wait for response within one interval
+				select {
+				case <-worker.HBAck:
+					timer.Reset(hbInterval)
+				case <-time.After(hbInterval / 2):
+					close(hbDead)
+					return
+				case <-hbDone:
 					return
 				}
 			case <-hbDone:
@@ -374,7 +384,6 @@ func handleWorker(ctx *Context, conn net.Conn) {
 				}
 				return
 			}
-			missedHB = 0
 
 			typ := strFromAny(msg["type"])
 
@@ -383,7 +392,15 @@ func handleWorker(ctx *Context, conn net.Conn) {
 				send_chunk(ctx, worker, workerID)
 
 			case "heartbeat_resp":
-				logHeartbeat(worker, msg)
+				select {
+				case <-hbDead:
+				default:
+					logHeartbeat(worker, msg)
+					select {
+					case worker.HBAck <- struct{}{}:
+					default:
+					}
+				}
 
 			case "result":
 				worker.SendMu.Lock()
@@ -401,6 +418,10 @@ func handleWorker(ctx *Context, conn net.Conn) {
 						}
 						if strFromAny(lm["type"]) == "heartbeat_resp" {
 							logHeartbeat(worker, lm)
+							select {
+							case worker.HBAck <- struct{}{}:
+							default:
+							}
 							continue
 						}
 						latMsg = lm
@@ -494,20 +515,13 @@ func handleWorker(ctx *Context, conn net.Conn) {
 				fmt.Printf("  Received unexpected message from worker %s: %s\n", workerID, typ)
 			}
 
-		case <-time.After(hbTimeout):
-			missedHB++
-			if atomic.LoadInt32(&ctx.FoundFlag) == 0 {
-				fmt.Printf("\nWORKER MISSED HEARTBEAT (WorkerID: %s) - %d/%d Attempts\n", workerID, missedHB, maxMissedHB)
-			}
-			if missedHB < maxMissedHB {
-				continue
-			}
+		case <-hbDead:
 			ctx.WorkersMu.Lock()
 			delete(ctx.Workers, worker.ID)
 			ctx.WorkersMu.Unlock()
 			_ = conn.Close()
 			if atomic.LoadInt32(&ctx.FoundFlag) == 0 {
-				fmt.Printf("\nWORKER TIMEOUT (WorkerID: %s) - missed %d heartbeats\n", workerID, maxMissedHB)
+				fmt.Printf("\nWORKER TIMEOUT (WorkerID: %s) - missed heartbeat\n", workerID)
 				ctx.WorkersMu.Lock()
 				activeCount := len(ctx.Workers)
 				ctx.WorkersMu.Unlock()
@@ -672,6 +686,10 @@ ackLoop:
 			}
 			if strFromAny(msg["type"]) == "heartbeat_resp" {
 				logHeartbeat(worker, msg)
+				select {
+				case worker.HBAck <- struct{}{}:
+				default:
+				}
 				continue
 			}
 			ack = msg
