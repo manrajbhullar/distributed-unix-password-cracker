@@ -47,11 +47,12 @@ type PasswordInfo struct {
 }
 
 type WorkerInfo struct {
-	Conn   net.Conn
-	SendMu sync.Mutex
-	ID     string
-	Addr   string
-	HasJob bool
+	Conn         net.Conn
+	SendMu       sync.Mutex
+	IncomingMsgs chan map[string]any
+	ID           string
+	Addr         string
+	HasJob       bool
 
 	CurrentJobID      int
 	CurrentChunkStart int64
@@ -352,137 +353,161 @@ func handleWorker(ctx *Context, conn net.Conn) {
 	}()
 	defer close(hbDone)
 
+	startWorkerReader(worker)
+
 	for {
-		_ = conn.SetReadDeadline(time.Now().Add(hbTimeout))
-		msg, err := recvMsg(conn)
-		_ = conn.SetReadDeadline(time.Time{})
-		if err != nil {
-			netErr, ok := err.(net.Error)
-			if ok && netErr.Timeout() {
-				missedHB++
+		select {
+		case msg, ok := <-worker.IncomingMsgs:
+			if !ok {
+				ctx.WorkersMu.Lock()
+				delete(ctx.Workers, worker.ID)
+				ctx.WorkersMu.Unlock()
+				_ = conn.Close()
 				if atomic.LoadInt32(&ctx.FoundFlag) == 0 {
-					fmt.Printf("\nWORKER MISSED HEARTBEAT (WorkerID: %s) - %d/%d Attempts\n", workerID, missedHB, maxMissedHB)
-				}
-				if missedHB < maxMissedHB {
-					continue
-				}
-			}
-			ctx.WorkersMu.Lock()
-			delete(ctx.Workers, worker.ID)
-			ctx.WorkersMu.Unlock()
-			_ = conn.Close()
-			if atomic.LoadInt32(&ctx.FoundFlag) == 0 {
-				if ok && netErr.Timeout() {
-					fmt.Printf("\nWORKER TIMEOUT (WorkerID: %s) - missed %d heartbeats\n", workerID, maxMissedHB)
-				} else {
 					fmt.Printf("\nWORKER DISCONNECTED (WorkerID: %s) - connection lost\n", workerID)
+					ctx.WorkersMu.Lock()
+					activeCount := len(ctx.Workers)
+					ctx.WorkersMu.Unlock()
+					if activeCount == 0 {
+						fmt.Printf("\nWAITING TO REGISTER WORKERS (Active: 0)\n")
+					}
+				}
+				return
+			}
+			missedHB = 0
+
+			typ := strFromAny(msg["type"])
+
+			switch typ {
+			case "job_request":
+				send_chunk(ctx, worker, workerID)
+
+			case "heartbeat_resp":
+				logHeartbeat(worker, msg)
+
+			case "result":
+				worker.SendMu.Lock()
+				_ = sendMsg(conn, map[string]any{"type": "result_ack"})
+				worker.SendMu.Unlock()
+
+				var latMsg map[string]any
+			latLoop:
+				for {
+					select {
+					case lm, ok := <-worker.IncomingMsgs:
+						if !ok {
+							fmt.Printf("  WARNING: Failed to receive result latency from worker %s\n", workerID)
+							break latLoop
+						}
+						if strFromAny(lm["type"]) == "heartbeat_resp" {
+							logHeartbeat(worker, lm)
+							continue
+						}
+						latMsg = lm
+						break latLoop
+					case <-time.After(5 * time.Second):
+						fmt.Printf("  WARNING: Failed to receive result latency from worker %s\n", workerID)
+						break latLoop
+					}
+				}
+
+				rrl := 0.0
+				if latMsg != nil {
+					rrl = floatFromAny(latMsg["result_return_latency"])
+				}
+				worker.ResultReturnLatency = &rrl
+
+				found := boolFromAny(msg["found"])
+				chunkEnd := worker.CurrentChunkStart + int64(worker.CurrentChunkSize)
+				attempts := floatFromAny(msg["attempts"])
+				atomic.AddInt64(&ctx.TotalAttempts, int64(attempts))
+				crackTime := floatFromAny(msg["compute_time"])
+				hps := 0.0
+				if crackTime > 0 {
+					hps = attempts / crackTime
+				}
+				resultMs := 0.0
+				if worker.ResultReturnLatency != nil {
+					resultMs = (*worker.ResultReturnLatency) * 1000
+				}
+				dispatchMs := 0.0
+				if worker.DispatchLatency != nil {
+					dispatchMs = (*worker.DispatchLatency) * 1000
 				}
 				ctx.WorkersMu.Lock()
-				activeCount := len(ctx.Workers)
+				if worker.DispatchLatency != nil {
+					ctx.DispatchLatencies = append(ctx.DispatchLatencies, *worker.DispatchLatency)
+				}
+				ctx.ResultLatencies = append(ctx.ResultLatencies, rrl)
+				ctx.ComputeTimes = append(ctx.ComputeTimes, crackTime)
 				ctx.WorkersMu.Unlock()
-				if activeCount == 0 {
-					fmt.Printf("\nWAITING TO REGISTER WORKERS (Active: 0)\n")
-				}
-			}
-			return
-		}
-		missedHB = 0
+				fmt.Printf("\nJOB #%d COMPLETE (WorkerID: %s)\n", worker.CurrentJobID, workerID)
+				fmt.Printf("  Status: %s\n", strFromAny(msg["status"]))
+				fmt.Printf("  Chunk: %d to %d\n", worker.CurrentChunkStart, chunkEnd)
+				fmt.Printf("  Attempts: %.0f\n", attempts)
+				fmt.Printf("  Time: %.2f seconds\n", crackTime)
+				fmt.Printf("  Speed: %.2f hashes/sec\n", hps)
+				fmt.Printf("  Dispatch Latency: %.2f ms\n", dispatchMs)
+				fmt.Printf("  Result Latency: %.2f ms\n", resultMs)
 
-		typ := strFromAny(msg["type"])
-
-		switch typ {
-		case "job_request":
-			send_chunk(ctx, worker, workerID)
-
-		case "heartbeat_resp":
-			delta := floatFromAny(msg["delta_tested"])
-			total := floatFromAny(msg["total_tested"])
-			threadsActive := intFromAny(msg["threads_active"])
-			rate := floatFromAny(msg["current_rate"])
-
-			fmt.Printf("\nHEARTBEAT (WorkerID: %s)\n", workerID)
-			fmt.Printf("  Delta Tested: %.0f\n", delta)
-			fmt.Printf("  Total Attempts: %.0f\n", total)
-			fmt.Printf("  Threads Active: %d\n", threadsActive)
-			fmt.Printf("  Current Rate: %.2f hashes/sec\n", rate)
-			fmt.Printf("  Current Job: %d\n", worker.CurrentJobID)
-
-		case "result":
-			worker.SendMu.Lock()
-			_ = sendMsg(conn, map[string]any{"type": "result_ack"})
-			worker.SendMu.Unlock()
-
-			latMsg, err := recvMsg(conn)
-			if err != nil {
-				fmt.Printf("  WARNING: Failed to receive result latency from worker %s\n", workerID)
-			}
-
-			rrl := 0.0
-			if latMsg != nil {
-				rrl = floatFromAny(latMsg["result_return_latency"])
-			}
-			worker.ResultReturnLatency = &rrl
-
-			found := boolFromAny(msg["found"])
-			chunkEnd := worker.CurrentChunkStart + int64(worker.CurrentChunkSize)
-			attempts := floatFromAny(msg["attempts"])
-			atomic.AddInt64(&ctx.TotalAttempts, int64(attempts))
-			crackTime := floatFromAny(msg["compute_time"])
-			hps := 0.0
-			if crackTime > 0 {
-				hps = attempts / crackTime
-			}
-			resultMs := 0.0
-			if worker.ResultReturnLatency != nil {
-				resultMs = (*worker.ResultReturnLatency) * 1000
-			}
-			dispatchMs := 0.0
-			if worker.DispatchLatency != nil {
-				dispatchMs = (*worker.DispatchLatency) * 1000
-			}
-			ctx.WorkersMu.Lock()
-			if worker.DispatchLatency != nil {
-				ctx.DispatchLatencies = append(ctx.DispatchLatencies, *worker.DispatchLatency)
-			}
-			ctx.ResultLatencies = append(ctx.ResultLatencies, rrl)
-			ctx.ComputeTimes = append(ctx.ComputeTimes, crackTime)
-			ctx.WorkersMu.Unlock()
-			fmt.Printf("\nJOB #%d COMPLETE (WorkerID: %s)\n", worker.CurrentJobID, workerID)
-			fmt.Printf("  Status: %s\n", strFromAny(msg["status"]))
-			fmt.Printf("  Chunk: %d to %d\n", worker.CurrentChunkStart, chunkEnd)
-			fmt.Printf("  Attempts: %.0f\n", attempts)
-			fmt.Printf("  Time: %.2f seconds\n", crackTime)
-			fmt.Printf("  Speed: %.2f hashes/sec\n", hps)
-			fmt.Printf("  Dispatch Latency: %.2f ms\n", dispatchMs)
-			fmt.Printf("  Result Latency: %.2f ms\n", resultMs)
-
-			if found {
-				if atomic.CompareAndSwapInt32(&ctx.FoundFlag, 0, 1) {
-					ctx.WorkersMu.Lock()
-					ctx.FoundPassword, _ = msg["password"].(string)
-					ctx.FoundByWorker = worker.ID
-					ctx.FoundByJobID = intFromAny(msg["job_id"])
-					ctx.FoundTime = time.Now()
-					for id, w := range ctx.Workers {
-						if id != worker.ID {
-							w.SendMu.Lock()
-						_ = sendMsg(w.Conn, map[string]any{"type": "force_stop"})
-						w.SendMu.Unlock()
+				if found {
+					if atomic.CompareAndSwapInt32(&ctx.FoundFlag, 0, 1) {
+						ctx.WorkersMu.Lock()
+						ctx.FoundPassword, _ = msg["password"].(string)
+						ctx.FoundByWorker = worker.ID
+						ctx.FoundByJobID = intFromAny(msg["job_id"])
+						ctx.FoundTime = time.Now()
+						for id, w := range ctx.Workers {
+							if id != worker.ID {
+								w.SendMu.Lock()
+								_ = sendMsg(w.Conn, map[string]any{"type": "force_stop"})
+								w.SendMu.Unlock()
+							}
 						}
+						ctx.WorkersMu.Unlock()
+						_ = ctx.ServerLn.Close()
+						close(ctx.Done)
 					}
-					ctx.WorkersMu.Unlock()
-					_ = ctx.ServerLn.Close()
-					close(ctx.Done)
 				}
+
+			case "disconnect":
+				ctx.WorkersMu.Lock()
+				delete(ctx.Workers, worker.ID)
+				ctx.WorkersMu.Unlock()
+				_ = conn.Close()
+				if atomic.LoadInt32(&ctx.FoundFlag) == 0 {
+					fmt.Printf("\nWORKER DISCONNECTED (WorkerID: %s) - worker exited\n", workerID)
+					ctx.WorkersMu.Lock()
+					activeCount := len(ctx.Workers)
+					ctx.WorkersMu.Unlock()
+					if activeCount == 0 {
+						fmt.Printf("\nWAITING TO REGISTER WORKERS (Active: 0)\n")
+					}
+				}
+				return
+
+			case "force_stop_ack":
+				attempts := floatFromAny(msg["attempts"])
+				atomic.AddInt64(&ctx.TotalAttempts, int64(attempts))
+
+			default:
+				fmt.Printf("  Received unexpected message from worker %s: %s\n", workerID, typ)
 			}
 
-		case "disconnect":
+		case <-time.After(hbTimeout):
+			missedHB++
+			if atomic.LoadInt32(&ctx.FoundFlag) == 0 {
+				fmt.Printf("\nWORKER MISSED HEARTBEAT (WorkerID: %s) - %d/%d Attempts\n", workerID, missedHB, maxMissedHB)
+			}
+			if missedHB < maxMissedHB {
+				continue
+			}
 			ctx.WorkersMu.Lock()
 			delete(ctx.Workers, worker.ID)
 			ctx.WorkersMu.Unlock()
 			_ = conn.Close()
 			if atomic.LoadInt32(&ctx.FoundFlag) == 0 {
-				fmt.Printf("\nWORKER DISCONNECTED (WorkerID: %s) - worker exited\n", workerID)
+				fmt.Printf("\nWORKER TIMEOUT (WorkerID: %s) - missed %d heartbeats\n", workerID, maxMissedHB)
 				ctx.WorkersMu.Lock()
 				activeCount := len(ctx.Workers)
 				ctx.WorkersMu.Unlock()
@@ -491,13 +516,6 @@ func handleWorker(ctx *Context, conn net.Conn) {
 				}
 			}
 			return
-
-		case "force_stop_ack":
-			attempts := floatFromAny(msg["attempts"])
-			atomic.AddInt64(&ctx.TotalAttempts, int64(attempts))
-
-		default:
-			fmt.Printf("  Received unexpected message from worker %s: %s\n", workerID, typ)
 		}
 	}
 }
@@ -544,6 +562,34 @@ func register_worker(ctx *Context, conn net.Conn, addr string) (*WorkerInfo, err
 
 	fmt.Printf("  Worker registered successfully (WorkerID: %s)\n", workerID)
 	return worker, nil
+}
+
+func startWorkerReader(worker *WorkerInfo) {
+	worker.IncomingMsgs = make(chan map[string]any, 16)
+	go func() {
+		for {
+			msg, err := recvMsg(worker.Conn)
+			if err != nil {
+				close(worker.IncomingMsgs)
+				return
+			}
+			worker.IncomingMsgs <- msg
+		}
+	}()
+}
+
+func logHeartbeat(worker *WorkerInfo, msg map[string]any) {
+	delta := floatFromAny(msg["delta_tested"])
+	total := floatFromAny(msg["total_tested"])
+	threadsActive := intFromAny(msg["threads_active"])
+	rate := floatFromAny(msg["current_rate"])
+
+	fmt.Printf("\nHEARTBEAT (WorkerID: %s)\n", worker.ID)
+	fmt.Printf("  Delta Tested: %.0f\n", delta)
+	fmt.Printf("  Total Attempts: %.0f\n", total)
+	fmt.Printf("  Threads Active: %d\n", threadsActive)
+	fmt.Printf("  Current Rate: %.2f hashes/sec\n", rate)
+	fmt.Printf("  Current Job: %d\n", worker.CurrentJobID)
 }
 
 func send_chunk(ctx *Context, worker *WorkerInfo, workerID string) {
@@ -609,16 +655,37 @@ func send_chunk(ctx *Context, worker *WorkerInfo, workerID string) {
 		return
 	}
 
-	ack, err := recvMsg(worker.Conn)
-	if err != nil {
-		ctx.WorkersMu.Lock()
-		delete(ctx.Workers, worker.ID)
-		ctx.WorkersMu.Unlock()
-		_ = worker.Conn.Close()
-		if atomic.LoadInt32(&ctx.FoundFlag) == 0 {
-			fmt.Printf("\nWORKER DISCONNECTED (WorkerID: %s) - no job ack\n", workerID)
+	var ack map[string]any
+ackLoop:
+	for {
+		select {
+		case msg, ok := <-worker.IncomingMsgs:
+			if !ok {
+				ctx.WorkersMu.Lock()
+				delete(ctx.Workers, worker.ID)
+				ctx.WorkersMu.Unlock()
+				_ = worker.Conn.Close()
+				if atomic.LoadInt32(&ctx.FoundFlag) == 0 {
+					fmt.Printf("\nWORKER DISCONNECTED (WorkerID: %s) - no job ack\n", workerID)
+				}
+				return
+			}
+			if strFromAny(msg["type"]) == "heartbeat_resp" {
+				logHeartbeat(worker, msg)
+				continue
+			}
+			ack = msg
+			break ackLoop
+		case <-time.After(5 * time.Second):
+			ctx.WorkersMu.Lock()
+			delete(ctx.Workers, worker.ID)
+			ctx.WorkersMu.Unlock()
+			_ = worker.Conn.Close()
+			if atomic.LoadInt32(&ctx.FoundFlag) == 0 {
+				fmt.Printf("\nWORKER DISCONNECTED (WorkerID: %s) - no job ack\n", workerID)
+			}
+			return
 		}
-		return
 	}
 
 	dispatchEnd := time.Now()
