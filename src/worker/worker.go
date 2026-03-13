@@ -458,12 +458,11 @@ func crack(ctx *Context) State {
 		"hps":          hps,
 		"status":       final_status,
 	}
-	fmt.Printf("  Compute Time: %.2f seconds\n", endTime.Sub(startTime).Seconds())
 	fmt.Printf("  Cracking has completed for this chunk after %d attempts\n", atomic.LoadInt64(&jobAttempts))
 
 	if atomic.LoadInt32(&ctx.ForceStop) == 1 {
 		fmt.Printf("\nPASSWORD FOUND\n")
-		fmt.Printf("  Stopped after %d password attempts for Job #%d\n", atomic.LoadInt64(&jobAttempts), intFromAny(job["job_id"]))
+		fmt.Printf("  Stopped %d password attempts into Job #%d\n", atomic.LoadInt64(&jobAttempts), intFromAny(job["job_id"]))
 		ctx.sendMu.Lock()
 		_ = sendMsg(ctx.Controller, map[string]any{
 			"type":     "force_stop_ack",

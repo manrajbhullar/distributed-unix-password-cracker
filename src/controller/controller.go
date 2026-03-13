@@ -88,8 +88,8 @@ type Context struct {
 	FoundPassword  string
 	FoundByWorker  string
 	FoundByJobID   int
-	FoundTime time.Time
-	E2E       float64
+	FoundTime      time.Time
+	E2E            float64
 
 	WorkerWG sync.WaitGroup
 
@@ -98,7 +98,7 @@ type Context struct {
 
 	DispatchLatencies []float64
 	ResultLatencies   []float64
-	ComputeTimes map[string][]float64
+	ComputeTimes      map[string][]float64
 	StoppedJobs       []StoppedJob
 
 	Done chan struct{}
@@ -830,7 +830,7 @@ func report_result(ctx *Context) {
 	if len(ctx.StoppedJobs) > 0 {
 		fmt.Printf("\nJOBS STOPPED EARLY:\n")
 		for _, sj := range ctx.StoppedJobs {
-			fmt.Printf("  WorkerID: %s - %d attempts for Job #%d\n", sj.WorkerID, sj.Attempts, sj.JobID)
+			fmt.Printf("  WorkerID: %s - %d attempts completed for Job #%d\n", sj.WorkerID, sj.Attempts, sj.JobID)
 		}
 	}
 
@@ -892,9 +892,9 @@ func main() {
 	ctx := &Context{
 		Workers:      make(map[string]*WorkerInfo),
 		ComputeTimes: make(map[string][]float64),
-		NextJobID:      1,
-		NextWorkerID:   1,
-		Done:           make(chan struct{}),
+		NextJobID:    1,
+		NextWorkerID: 1,
+		Done:         make(chan struct{}),
 	}
 
 	handlers := map[State]Handler{
