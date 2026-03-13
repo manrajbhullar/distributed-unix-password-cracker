@@ -62,12 +62,20 @@ type WorkerInfo struct {
 	RuntimeStart        *time.Time
 	DispatchLatency     *float64
 	ResultReturnLatency *float64
+
+	PendingReassign *RemainingChunk
 }
 
 type StoppedJob struct {
 	WorkerID string
 	JobID    int
 	Attempts int64
+}
+
+type RemainingChunk struct {
+	JobID int
+	Start int64
+	Size  int
 }
 
 type Context struct {
@@ -100,6 +108,7 @@ type Context struct {
 	ResultLatencies   []float64
 	ComputeTimes      map[string][]float64
 	StoppedJobs       []StoppedJob
+	RemainingChunks   []RemainingChunk
 
 	Done chan struct{}
 
@@ -486,7 +495,11 @@ func handleWorker(ctx *Context, conn net.Conn) {
 				ctx.ResultLatencies = append(ctx.ResultLatencies, rrl)
 				ctx.ComputeTimes[workerID] = append(ctx.ComputeTimes[workerID], crackTime)
 				ctx.WorkersMu.Unlock()
-				fmt.Printf("\nJOB #%d COMPLETE (WorkerID: %s)\n", worker.CurrentJobID, workerID)
+				jobLabel := "COMPLETE"
+				if strFromAny(msg["status"]) == "Manually Interrupted" {
+					jobLabel = "INCOMPLETE"
+				}
+				fmt.Printf("\nJOB #%d %s (WorkerID: %s)\n", worker.CurrentJobID, jobLabel, workerID)
 				fmt.Printf("  Status: %s\n", strFromAny(msg["status"]))
 				fmt.Printf("  Chunk: %d to %d\n", worker.CurrentChunkStart, chunkEnd)
 				fmt.Printf("  Attempts: %.0f\n", attempts)
@@ -494,6 +507,22 @@ func handleWorker(ctx *Context, conn net.Conn) {
 				fmt.Printf("  Speed: %.2f hashes/sec\n", hps)
 				fmt.Printf("  Dispatch Latency: %.2f ms\n", dispatchMs)
 				fmt.Printf("  Result Latency: %.2f ms\n", resultMs)
+
+				if strFromAny(msg["status"]) == "Manually Interrupted" {
+					remainStart := worker.CurrentChunkStart + int64(attempts)
+					remainSize := int(int64(worker.CurrentChunkSize) - int64(attempts))
+					if remainSize > 0 {
+						rc := RemainingChunk{
+							JobID: worker.CurrentJobID,
+							Start: remainStart,
+							Size:  remainSize,
+						}
+						ctx.WorkersMu.Lock()
+						ctx.RemainingChunks = append(ctx.RemainingChunks, rc)
+						ctx.WorkersMu.Unlock()
+						worker.PendingReassign = &rc
+					}
+				}
 
 				if found {
 					if atomic.CompareAndSwapInt32(&ctx.FoundFlag, 0, 1) {
@@ -523,6 +552,10 @@ func handleWorker(ctx *Context, conn net.Conn) {
 				_ = conn.Close()
 				if atomic.LoadInt32(&ctx.FoundFlag) == 0 {
 					fmt.Printf("\nWORKER DISCONNECTED (WorkerID: %s) - worker exited\n", workerID)
+					if worker.PendingReassign != nil {
+						rc := worker.PendingReassign
+						fmt.Printf("\nJOB #%d QUEUED FOR REASSIGNMENT (Remaining Chunk: %d to %d)\n", rc.JobID, rc.Start, rc.Start+int64(rc.Size))
+					}
 					ctx.WorkersMu.Lock()
 					activeCount := len(ctx.Workers)
 					ctx.WorkersMu.Unlock()
@@ -675,11 +708,24 @@ func send_chunk(ctx *Context, worker *WorkerInfo, workerID string) {
 	}
 
 	ctx.WorkersMu.Lock()
-	jobID := ctx.NextJobID
-	ctx.NextJobID++
-	chunkStart := ctx.NextChunkStart
-	chunkSize := ctx.Settings.ChunkSize
-	ctx.NextChunkStart += int64(chunkSize)
+	var jobID int
+	var chunkStart int64
+	var chunkSize int
+	reassigned := false
+	if len(ctx.RemainingChunks) > 0 {
+		rc := ctx.RemainingChunks[0]
+		ctx.RemainingChunks = ctx.RemainingChunks[1:]
+		jobID = rc.JobID
+		chunkStart = rc.Start
+		chunkSize = rc.Size
+		reassigned = true
+	} else {
+		jobID = ctx.NextJobID
+		ctx.NextJobID++
+		chunkStart = ctx.NextChunkStart
+		chunkSize = ctx.Settings.ChunkSize
+		ctx.NextChunkStart += int64(chunkSize)
+	}
 	worker.CurrentJobID = jobID
 	worker.CurrentChunkStart = chunkStart
 	worker.CurrentChunkSize = chunkSize
@@ -776,7 +822,11 @@ ackLoop:
 		fmt.Printf("  WARNING: Unexpected ack from worker %s: %v\n", workerID, ack)
 	}
 
-	fmt.Printf("\nDISPATCHED JOB #%d (WorkerID: %s)\n", jobID, workerID)
+	if reassigned {
+		fmt.Printf("\nREASSIGNED JOB #%d (WorkerID: %s)\n", jobID, workerID)
+	} else {
+		fmt.Printf("\nDISPATCHED JOB #%d (WorkerID: %s)\n", jobID, workerID)
+	}
 	fmt.Printf("  Chunk: %d to %d\n", chunkStart, chunkStart+int64(chunkSize))
 	fmt.Printf("  Dispatch Latency: %.2f milliseconds (C -> W)\n", lat*1000)
 }
