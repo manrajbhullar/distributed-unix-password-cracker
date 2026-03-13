@@ -213,7 +213,7 @@ func request_job(ctx *Context) State {
 
 	if strFromAny(job["type"]) == "force_stop" {
 		fmt.Printf("\nPASSWORD FOUND\n")
-		fmt.Printf("  No active job\n")
+		fmt.Printf("  Stopped during no active job\n")
 		ctx.sendMu.Lock()
 		_ = sendMsg(ctx.Controller, map[string]any{
 			"type":     "force_stop_ack",
