@@ -182,7 +182,7 @@ func register(ctx *Context) State {
 		strFromAny(resp["username"]),
 		strFromAny(resp["alg_id"]),
 	)
-	time.Sleep(time.Second * 10)
+	time.Sleep(time.Second * 5)
 	startMessageReader(ctx)
 	return StateRequestJob
 }

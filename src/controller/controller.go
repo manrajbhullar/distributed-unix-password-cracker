@@ -333,6 +333,7 @@ func handleWorker(ctx *Context, conn net.Conn) {
 
 	hbDone := make(chan struct{})
 	worker.HBAck = make(chan struct{}, 1)
+	maxMissedHB := 3
 	hbDead := make(chan struct{})
 	go func() {
 		timer := time.NewTimer(hbInterval)
@@ -346,15 +347,26 @@ func handleWorker(ctx *Context, conn net.Conn) {
 				if err != nil {
 					return
 				}
-				// Wait for response within one interval
-				select {
-				case <-worker.HBAck:
-					timer.Reset(hbInterval)
-				case <-time.After(hbInterval / 2):
-					close(hbDead)
-					return
-				case <-hbDone:
-					return
+				missWindow := hbInterval / time.Duration(maxMissedHB)
+				missed := 0
+			waitLoop:
+				for {
+					select {
+					case <-worker.HBAck:
+						timer.Reset(hbInterval)
+						break waitLoop
+					case <-time.After(missWindow):
+						missed++
+						if atomic.LoadInt32(&ctx.FoundFlag) == 0 {
+							fmt.Printf("\nWORKER MISSED HEARTBEAT (WorkerID: %s) - %d/%d Attempts\n", workerID, missed, maxMissedHB)
+						}
+						if missed >= maxMissedHB {
+							close(hbDead)
+							return
+						}
+					case <-hbDone:
+						return
+					}
 				}
 			case <-hbDone:
 				return
