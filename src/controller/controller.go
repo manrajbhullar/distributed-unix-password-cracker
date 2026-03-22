@@ -32,11 +32,12 @@ const (
 )
 
 type Settings struct {
-	Filename          string
-	Username          string
-	Port              int
-	HeartbeatInterval int
-	ChunkSize         int
+	Filename           string
+	Username           string
+	Port               int
+	HeartbeatInterval  int
+	ChunkSize          int
+	CheckpointInterval int
 }
 
 type PasswordInfo struct {
@@ -58,6 +59,7 @@ type WorkerInfo struct {
 	CurrentJobID      int
 	CurrentChunkStart int64
 	CurrentChunkSize  int
+	LastCheckpoint    int64
 
 	RuntimeStart        *time.Time
 	DispatchLatency     *float64
@@ -101,7 +103,8 @@ type Context struct {
 
 	WorkerWG sync.WaitGroup
 
-	TotalAttempts  int64
+	TotalAttempts      int64
+	TotalCheckpoints   int64
 	CrackStartTime *time.Time
 
 	DispatchLatencies []float64
@@ -128,12 +131,14 @@ func parse_arguments(ctx *Context) State {
 	var port int
 	var heartbeat int
 	var chunkSize int
+	var checkpointInterval int
 
 	fs.StringVar(&filename, "f", "", "Name of shadow file")
 	fs.StringVar(&username, "u", "", "Username whose password being cracked")
 	fs.IntVar(&port, "p", 0, "Port number control server runs on")
 	fs.IntVar(&heartbeat, "b", -1, "Heartbeat interval in seconds")
 	fs.IntVar(&chunkSize, "c", 0, "Chunk size in number of candidates per job")
+	fs.IntVar(&checkpointInterval, "k", 0, "Checkpoint interval in candidate attempts")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		ctx.ExitMessage = err.Error()
@@ -152,6 +157,7 @@ func parse_arguments(ctx *Context) State {
 	ctx.Settings.Port = port
 	ctx.Settings.HeartbeatInterval = heartbeat
 	ctx.Settings.ChunkSize = chunkSize
+	ctx.Settings.CheckpointInterval = checkpointInterval
 
 	return StateHandleArgs
 }
@@ -411,6 +417,22 @@ func handleWorker(ctx *Context, conn net.Conn) {
 				_ = conn.Close()
 				if atomic.LoadInt32(&ctx.FoundFlag) == 0 {
 					fmt.Printf("\nWORKER DISCONNECTED (WorkerID: %s) - connection lost\n", workerID)
+					if worker.HasJob {
+						chunkEnd := worker.CurrentChunkStart + int64(worker.CurrentChunkSize)
+						remainStart := worker.LastCheckpoint
+						remainSize := int(chunkEnd - remainStart)
+						if remainSize > 0 {
+							rc := RemainingChunk{
+								JobID: worker.CurrentJobID,
+								Start: remainStart,
+								Size:  remainSize,
+							}
+							ctx.WorkersMu.Lock()
+							ctx.RemainingChunks = append(ctx.RemainingChunks, rc)
+							ctx.WorkersMu.Unlock()
+							fmt.Printf("\nJOB #%d QUEUED FOR REASSIGNMENT (Remaining Chunk: %d to %d)\n", rc.JobID, rc.Start, rc.Start+int64(rc.Size))
+						}
+					}
 					ctx.WorkersMu.Lock()
 					activeCount := len(ctx.Workers)
 					ctx.WorkersMu.Unlock()
@@ -545,7 +567,19 @@ func handleWorker(ctx *Context, conn net.Conn) {
 					}
 				}
 
-			case "disconnect":
+			case "checkpoint":
+			cpAttempts := int64(floatFromAny(msg["attempts"]))
+			worker.LastCheckpoint = worker.CurrentChunkStart + cpAttempts
+			atomic.AddInt64(&ctx.TotalCheckpoints, 1)
+			fmt.Printf("\nCHECKPOINT (WorkerID: %s)\n", workerID)
+			pct := float64(cpAttempts) / float64(worker.CurrentChunkSize) * 100
+			fmt.Printf("  Position: %d\n", worker.LastCheckpoint)
+			fmt.Printf("  Attempts into Job: %d\n", cpAttempts)
+			fmt.Printf("  Current Job: %d\n", worker.CurrentJobID)
+			fmt.Printf("  Current Chunk: %d to %d\n", worker.CurrentChunkStart, worker.CurrentChunkStart+int64(worker.CurrentChunkSize))
+			fmt.Printf("  Current Progress: %.1f%%\n", pct)
+
+		case "disconnect":
 				ctx.WorkersMu.Lock()
 				delete(ctx.Workers, worker.ID)
 				ctx.WorkersMu.Unlock()
@@ -615,6 +649,22 @@ func handleWorker(ctx *Context, conn net.Conn) {
 			_ = conn.Close()
 			if atomic.LoadInt32(&ctx.FoundFlag) == 0 {
 				fmt.Printf("\nWORKER TIMEOUT (WorkerID: %s) - missed heartbeat\n", workerID)
+				if worker.HasJob {
+					chunkEnd := worker.CurrentChunkStart + int64(worker.CurrentChunkSize)
+					remainStart := worker.LastCheckpoint
+					remainSize := int(chunkEnd - remainStart)
+					if remainSize > 0 {
+						rc := RemainingChunk{
+							JobID: worker.CurrentJobID,
+							Start: remainStart,
+							Size:  remainSize,
+						}
+						ctx.WorkersMu.Lock()
+						ctx.RemainingChunks = append(ctx.RemainingChunks, rc)
+						ctx.WorkersMu.Unlock()
+						fmt.Printf("\nJOB #%d QUEUED FOR REASSIGNMENT (Remaining Chunk: %d to %d)\n", rc.JobID, rc.Start, rc.Start+int64(rc.Size))
+					}
+				}
 				ctx.WorkersMu.Lock()
 				activeCount := len(ctx.Workers)
 				ctx.WorkersMu.Unlock()
@@ -729,6 +779,7 @@ func send_chunk(ctx *Context, worker *WorkerInfo, workerID string) {
 	worker.CurrentJobID = jobID
 	worker.CurrentChunkStart = chunkStart
 	worker.CurrentChunkSize = chunkSize
+	worker.LastCheckpoint = chunkStart
 	worker.HasJob = true
 	if ctx.CrackStartTime == nil {
 		now := time.Now()
@@ -755,9 +806,11 @@ func send_chunk(ctx *Context, worker *WorkerInfo, workerID string) {
 		"hash":        ctx.PwInfo.Hash,
 		"hash_full":   ctx.PwInfo.Full,
 		"charset":     charset,
-		"chunk_start": chunkStart,
-		"chunk_size":  chunkSize,
-		"hb_interval": ctx.Settings.HeartbeatInterval,
+		"chunk_start":          chunkStart,
+		"chunk_size":           chunkSize,
+		"hb_interval":          ctx.Settings.HeartbeatInterval,
+		"checkpoint_interval":  ctx.Settings.CheckpointInterval,
+		"reassigned":           reassigned,
 	}
 
 	dispatchStart := time.Now()
@@ -899,6 +952,8 @@ func report_result(ctx *Context) {
 	fmt.Printf("PARSING TIME: %.2f milliseconds\n", parseMs)
 	fmt.Printf("DISPATCH LATENCY (AVG): %.2f milliseconds\n", avgDispatchMs)
 	fmt.Printf("RESULT LATENCY (AVG): %.2f milliseconds\n", avgResultMs)
+	fmt.Printf("CHECKPOINT FREQUENCY: %d attempts\n", ctx.Settings.CheckpointInterval)
+	fmt.Printf("CHECKPOINTS RECEIVED: %d\n", atomic.LoadInt64(&ctx.TotalCheckpoints))
 	fmt.Printf("CRACKED BY: Worker #%s in Job #%d\n", ctx.FoundByWorker, ctx.FoundByJobID)
 	fmt.Println(strings.Repeat("=", boxWidth))
 }

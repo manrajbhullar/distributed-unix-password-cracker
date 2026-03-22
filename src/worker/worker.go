@@ -279,7 +279,7 @@ func startMessageReader(ctx *Context) {
 				ctx.sendMu.Lock()
 				_ = sendMsg(ctx.Controller, resp)
 				ctx.sendMu.Unlock()
-				fmt.Printf("  Sent heartbeat response (%s)\n", now.Format("15:04:05"))
+				fmt.Printf("  Sent heartbeat response (time: %s)\n", now.Format("15:04:05"))
 				continue
 			}
 			ctx.IncomingMsgs <- msg
@@ -298,7 +298,11 @@ func crack(ctx *Context) State {
 	chunkStart := int64FromAny(job["chunk_start"])
 	chunkEnd := chunkStart + int64(intFromAny(job["chunk_size"]))
 
-	fmt.Printf("\nJOB #%d STARTED\n", intFromAny(job["job_id"]))
+	jobLabel := "STARTED"
+	if boolFromAny(job["reassigned"]) {
+		jobLabel = "RESUMED"
+	}
+	fmt.Printf("\nJOB #%d %s\n", intFromAny(job["job_id"]), jobLabel)
 	fmt.Printf("  Cracking passwords %d to %d in this chunk with %d threads...\n", chunkStart, chunkEnd, threads)
 
 	startTime := time.Now()
@@ -392,6 +396,8 @@ func crack(ctx *Context) State {
 		}
 	}
 
+	checkpointInterval := int64(intFromAny(job["checkpoint_interval"]))
+
 	worker := func(id int) {
 		_ = id
 		defer wg.Done()
@@ -401,8 +407,18 @@ func crack(ctx *Context) State {
 				return
 			}
 			localAttempts++
-			atomic.AddInt64(&jobAttempts, 1)
+			cur := atomic.AddInt64(&jobAttempts, 1)
 			atomic.AddInt64(&ctx.TotalAttempts, 1)
+			if checkpointInterval > 0 && cur%checkpointInterval == 0 && cur < chunkEnd-chunkStart {
+				ctx.sendMu.Lock()
+				_ = sendMsg(ctx.Controller, map[string]any{
+					"type":     "checkpoint",
+					"job_id":   job["job_id"],
+					"attempts": cur,
+				})
+				ctx.sendMu.Unlock()
+				fmt.Printf("  Sent checkpoint (position: %d)\n", chunkStart+cur)
+			}
 			if verifyCandidate(candidate) {
 				if atomic.CompareAndSwapInt32(&foundFlag, 0, 1) {
 					foundMu.Lock()
@@ -495,12 +511,14 @@ func send_job_result(ctx *Context) State {
 	err := sendMsg(ctx.Controller, result_msg)
 	ctx.sendMu.Unlock()
 	if err != nil {
+		fmt.Printf("\nCONTROLLER DISCONNECTED - failed to send result\n")
 		return StateCleanup
 	}
 
 	for {
 		msg, ok := <-ctx.IncomingMsgs
 		if !ok {
+			fmt.Printf("\nCONTROLLER DISCONNECTED - connection lost\n")
 			return StateCleanup
 		}
 		if strFromAny(msg["type"]) == "force_stop" {
@@ -680,6 +698,11 @@ func intFromAny(v any) int {
 	default:
 		return 0
 	}
+}
+
+func boolFromAny(v any) bool {
+	b, _ := v.(bool)
+	return b
 }
 
 func int64FromAny(v any) int64 {
