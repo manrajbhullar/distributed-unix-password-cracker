@@ -524,6 +524,12 @@ func send_job_result(ctx *Context) State {
 
 	fmt.Printf("\nJOB #%d RESULT SENT\n", intFromAny(ctx.JobData["job_id"]))
 	fmt.Printf("  Status: %s\n", strFromAny(result["status"]))
+	if strFromAny(result["status"]) == "Manually Interrupted" {
+		chunkStart := int64FromAny(ctx.JobData["chunk_start"])
+		chunkEnd := chunkStart + int64(intFromAny(ctx.JobData["chunk_size"]))
+		remainStart := chunkStart + int64(result["attempts"].(int))
+		fmt.Printf("  Remaining Chunk: %d to %d\n", remainStart, chunkEnd)
+	}
 	if found {
 		fmt.Printf("  Password: %s\n", strFromAny(result["password"]))
 	}
