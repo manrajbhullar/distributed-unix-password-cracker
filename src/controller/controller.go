@@ -575,9 +575,9 @@ func handleWorker(ctx *Context, conn net.Conn) {
 			pct := float64(cpAttempts) / float64(worker.CurrentChunkSize) * 100
 			fmt.Printf("  Position: %d\n", worker.LastCheckpoint)
 			fmt.Printf("  Attempts into Job: %d\n", cpAttempts)
+			fmt.Printf("  Current Progress: %.1f%%\n", pct)
 			fmt.Printf("  Current Job: %d\n", worker.CurrentJobID)
 			fmt.Printf("  Current Chunk: %d to %d\n", worker.CurrentChunkStart, worker.CurrentChunkStart+int64(worker.CurrentChunkSize))
-			fmt.Printf("  Current Progress: %.1f%%\n", pct)
 
 		case "disconnect":
 				ctx.WorkersMu.Lock()
