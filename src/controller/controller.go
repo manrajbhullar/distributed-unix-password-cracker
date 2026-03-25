@@ -24,9 +24,7 @@ const (
 	StateHandleArgs
 	StateParseShadow
 	StateListen
-	StateRegisterWorker
 	StateMonitorProgress
-	StateDispatchJob
 	StateError
 	StateCleanup
 )
@@ -692,24 +690,28 @@ latLoop:
 	}
 
 	if found {
-		if atomic.CompareAndSwapInt32(&ctx.FoundFlag, 0, 1) {
-			ctx.WorkersMu.Lock()
-			ctx.FoundPassword, _ = msg["password"].(string)
-			ctx.FoundByWorker = worker.ID
-			ctx.FoundByJobID = intFromAny(msg["job_id"])
-			ctx.FoundTime = time.Now()
-			ctx.E2E = ctx.FoundTime.Sub(*ctx.CrackStartTime).Seconds()
-			for id, w := range ctx.Workers {
-				if id != worker.ID {
-					w.SendMu.Lock()
-					_ = sendMsg(w.Conn, map[string]any{"type": "force_stop"})
-					w.SendMu.Unlock()
-				}
+		send_stop_all(ctx, worker, msg)
+	}
+}
+
+func send_stop_all(ctx *Context, worker *WorkerInfo, msg map[string]any) {
+	if atomic.CompareAndSwapInt32(&ctx.FoundFlag, 0, 1) {
+		ctx.WorkersMu.Lock()
+		ctx.FoundPassword, _ = msg["password"].(string)
+		ctx.FoundByWorker = worker.ID
+		ctx.FoundByJobID = intFromAny(msg["job_id"])
+		ctx.FoundTime = time.Now()
+		ctx.E2E = ctx.FoundTime.Sub(*ctx.CrackStartTime).Seconds()
+		for id, w := range ctx.Workers {
+			if id != worker.ID {
+				w.SendMu.Lock()
+				_ = sendMsg(w.Conn, map[string]any{"type": "force_stop"})
+				w.SendMu.Unlock()
 			}
-			ctx.WorkersMu.Unlock()
-			_ = ctx.ServerLn.Close()
-			close(ctx.Done)
 		}
+		ctx.WorkersMu.Unlock()
+		_ = ctx.ServerLn.Close()
+		close(ctx.Done)
 	}
 }
 
