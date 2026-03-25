@@ -417,22 +417,7 @@ func handle_worker(ctx *Context, conn net.Conn) {
 				_ = conn.Close()
 				if atomic.LoadInt32(&ctx.FoundFlag) == 0 {
 					fmt.Printf("\nWORKER DISCONNECTED (WorkerID: %s) - connection lost\n", workerID)
-					if worker.HasJob {
-						chunkEnd := worker.CurrentChunkStart + int64(worker.CurrentChunkSize)
-						remainStart := worker.LastCheckpoint
-						remainSize := int(chunkEnd - remainStart)
-						if remainSize > 0 {
-							rc := RemainingChunk{
-								JobID: worker.CurrentJobID,
-								Start: remainStart,
-								Size:  remainSize,
-							}
-							ctx.WorkersMu.Lock()
-							ctx.RemainingChunks = append(ctx.RemainingChunks, rc)
-							ctx.WorkersMu.Unlock()
-							fmt.Printf("\nJOB #%d QUEUED FOR REASSIGNMENT (Remaining Chunk: %d to %d)\n", rc.JobID, rc.Start, rc.Start+int64(rc.Size))
-						}
-					}
+					queue_reassignment(ctx, worker)
 					ctx.WorkersMu.Lock()
 					activeCount := len(ctx.Workers)
 					ctx.WorkersMu.Unlock()
@@ -481,15 +466,7 @@ func handle_worker(ctx *Context, conn net.Conn) {
 						return
 					}
 					if strFromAny(msg["type"]) == "force_stop_ack" {
-						attempts := int64(floatFromAny(msg["attempts"]))
-						atomic.AddInt64(&ctx.TotalAttempts, attempts)
-						ctx.WorkersMu.Lock()
-						ctx.StoppedJobs = append(ctx.StoppedJobs, StoppedJob{
-							WorkerID: workerID,
-							JobID:    worker.CurrentJobID,
-							Attempts: attempts,
-						})
-						ctx.WorkersMu.Unlock()
+						record_stop_point(ctx, worker, msg)
 						return
 					}
 				case <-deadline:
@@ -504,22 +481,7 @@ func handle_worker(ctx *Context, conn net.Conn) {
 			_ = conn.Close()
 			if atomic.LoadInt32(&ctx.FoundFlag) == 0 {
 				fmt.Printf("\nWORKER TIMEOUT (WorkerID: %s) - missed heartbeat\n", workerID)
-				if worker.HasJob {
-					chunkEnd := worker.CurrentChunkStart + int64(worker.CurrentChunkSize)
-					remainStart := worker.LastCheckpoint
-					remainSize := int(chunkEnd - remainStart)
-					if remainSize > 0 {
-						rc := RemainingChunk{
-							JobID: worker.CurrentJobID,
-							Start: remainStart,
-							Size:  remainSize,
-						}
-						ctx.WorkersMu.Lock()
-						ctx.RemainingChunks = append(ctx.RemainingChunks, rc)
-						ctx.WorkersMu.Unlock()
-						fmt.Printf("\nJOB #%d QUEUED FOR REASSIGNMENT (Remaining Chunk: %d to %d)\n", rc.JobID, rc.Start, rc.Start+int64(rc.Size))
-					}
-				}
+				queue_reassignment(ctx, worker)
 				ctx.WorkersMu.Lock()
 				activeCount := len(ctx.Workers)
 				ctx.WorkersMu.Unlock()
@@ -620,6 +582,25 @@ func record_stop_point(ctx *Context, worker *WorkerInfo, msg map[string]any) {
 		Attempts: attempts,
 	})
 	ctx.WorkersMu.Unlock()
+}
+
+func queue_reassignment(ctx *Context, worker *WorkerInfo) {
+	if worker.HasJob {
+		chunkEnd := worker.CurrentChunkStart + int64(worker.CurrentChunkSize)
+		remainStart := worker.LastCheckpoint
+		remainSize := int(chunkEnd - remainStart)
+		if remainSize > 0 {
+			rc := RemainingChunk{
+				JobID: worker.CurrentJobID,
+				Start: remainStart,
+				Size:  remainSize,
+			}
+			ctx.WorkersMu.Lock()
+			ctx.RemainingChunks = append(ctx.RemainingChunks, rc)
+			ctx.WorkersMu.Unlock()
+			fmt.Printf("\nJOB #%d QUEUED FOR REASSIGNMENT (Remaining Chunk: %d to %d)\n", rc.JobID, rc.Start, rc.Start+int64(rc.Size))
+		}
+	}
 }
 
 func receive_job_result(ctx *Context, worker *WorkerInfo, msg map[string]any, hbDead chan struct{}) {
