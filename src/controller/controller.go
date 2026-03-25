@@ -467,7 +467,7 @@ func handle_worker(ctx *Context, conn net.Conn) {
 							break latLoop
 						}
 						if strFromAny(lm["type"]) == "heartbeat_resp" {
-							logHeartbeat(worker, lm)
+							log_heartbeat(worker, lm)
 							select {
 							case worker.HBAck <- struct{}{}:
 							default:
@@ -560,16 +560,7 @@ func handle_worker(ctx *Context, conn net.Conn) {
 				}
 
 			case "checkpoint":
-			cpAttempts := int64(floatFromAny(msg["attempts"]))
-			worker.LastCheckpoint = worker.CurrentChunkStart + cpAttempts
-			atomic.AddInt64(&ctx.TotalCheckpoints, 1)
-			fmt.Printf("\nCHECKPOINT (WorkerID: %s)\n", workerID)
-			pct := float64(cpAttempts) / float64(worker.CurrentChunkSize) * 100
-			fmt.Printf("  Position: %d\n", worker.LastCheckpoint)
-			fmt.Printf("  Attempts into Job: %d\n", cpAttempts)
-			fmt.Printf("  Current Progress: %.1f%%\n", pct)
-			fmt.Printf("  Current Job: %d\n", worker.CurrentJobID)
-			fmt.Printf("  Current Chunk: %d to %d\n", worker.CurrentChunkStart, worker.CurrentChunkStart+int64(worker.CurrentChunkSize))
+				receive_checkpoint(ctx, worker, msg)
 
 		case "disconnect":
 				ctx.WorkersMu.Lock()
@@ -727,11 +718,24 @@ func monitor_worker(worker *WorkerInfo) {
 	}()
 }
 
+func receive_checkpoint(ctx *Context, worker *WorkerInfo, msg map[string]any) {
+	cpAttempts := int64(floatFromAny(msg["attempts"]))
+	worker.LastCheckpoint = worker.CurrentChunkStart + cpAttempts
+	atomic.AddInt64(&ctx.TotalCheckpoints, 1)
+	fmt.Printf("\nCHECKPOINT (WorkerID: %s)\n", worker.ID)
+	pct := float64(cpAttempts) / float64(worker.CurrentChunkSize) * 100
+	fmt.Printf("  Position: %d\n", worker.LastCheckpoint)
+	fmt.Printf("  Attempts into Job: %d\n", cpAttempts)
+	fmt.Printf("  Current Progress: %.1f%%\n", pct)
+	fmt.Printf("  Current Job: %d\n", worker.CurrentJobID)
+	fmt.Printf("  Current Chunk: %d to %d\n", worker.CurrentChunkStart, worker.CurrentChunkStart+int64(worker.CurrentChunkSize))
+}
+
 func receive_heartbeat(worker *WorkerInfo, msg map[string]any, hbDead chan struct{}) {
 	select {
 	case <-hbDead:
 	default:
-		logHeartbeat(worker, msg)
+		log_heartbeat(worker, msg)
 		select {
 		case worker.HBAck <- struct{}{}:
 		default:
@@ -739,7 +743,7 @@ func receive_heartbeat(worker *WorkerInfo, msg map[string]any, hbDead chan struc
 	}
 }
 
-func logHeartbeat(worker *WorkerInfo, msg map[string]any) {
+func log_heartbeat(worker *WorkerInfo, msg map[string]any) {
 	delta := floatFromAny(msg["delta_tested"])
 	total := floatFromAny(msg["total_tested"])
 	threadsActive := intFromAny(msg["threads_active"])
@@ -848,7 +852,7 @@ ackLoop:
 				return
 			}
 			if strFromAny(msg["type"]) == "heartbeat_resp" {
-				logHeartbeat(worker, msg)
+				log_heartbeat(worker, msg)
 				select {
 				case worker.HBAck <- struct{}{}:
 				default:
