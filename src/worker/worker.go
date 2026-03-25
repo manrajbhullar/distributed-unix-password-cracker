@@ -38,12 +38,11 @@ type State int
 const (
 	StateParseArgs State = iota
 	StateHandleArgs
-	StateConnect
 	StateRegister
 	StateRequestJob
 	StateCrack
 	StateSendJobResult
-	StateStopWorker
+	StateForceStop
 	StateError
 	StateCleanup
 )
@@ -130,10 +129,10 @@ func handle_arguments(ctx *Context) State {
 
 	fmt.Printf("THREADS: %d\n", ctx.Settings.Threads)
 
-	return StateConnect
+	return StateRegister
 }
 
-func connect(ctx *Context) State {
+func register(ctx *Context) State {
 	host := ctx.Settings.ControllerHost
 	port := ctx.Settings.ControllerPort
 
@@ -145,14 +144,6 @@ func connect(ctx *Context) State {
 
 	ctx.Controller = conn
 	fmt.Printf("\nCONNECTED TO CONTROLLER: %s:%d\n", host, port)
-	return StateRegister
-}
-
-func register(ctx *Context) State {
-	if ctx.Controller == nil {
-		ctx.ExitMessage = "ERROR: No controller socket"
-		return StateError
-	}
 
 	fmt.Println("  Sending registration request...")
 
@@ -182,7 +173,7 @@ func register(ctx *Context) State {
 		strFromAny(resp["username"]),
 		strFromAny(resp["alg_id"]),
 	)
-	//time.Sleep(time.Second * 5)
+
 	startMessageReader(ctx)
 	return StateRequestJob
 }
@@ -208,7 +199,7 @@ func request_job(ctx *Context) State {
 	}
 
 	if strFromAny(job["type"]) == "stop" {
-		return StateStopWorker
+		return StateForceStop
 	}
 
 	if strFromAny(job["type"]) == "force_stop" {
@@ -566,7 +557,7 @@ func send_job_result(ctx *Context) State {
 	return StateRequestJob
 }
 
-func stop_worker(ctx *Context) State {
+func force_stop(ctx *Context) State {
 	fmt.Printf("\nSTOP RECEIVED (WorkerID: %s) - password found by another worker\n", ctx.WorkerID)
 	ctx.sendMu.Lock()
 	_ = sendMsg(ctx.Controller, map[string]any{
@@ -588,7 +579,7 @@ func cleanup(ctx *Context) State {
 	}
 	fmt.Printf("\nEXITING PROGRAM\n")
 	os.Exit(0)
-	return StateCleanup
+	return 0
 }
 
 func main() {
@@ -599,12 +590,11 @@ func main() {
 	handlers := map[State]Handler{
 		StateParseArgs:     parse_arguments,
 		StateHandleArgs:    handle_arguments,
-		StateConnect:       connect,
 		StateRegister:      register,
 		StateRequestJob:    request_job,
 		StateCrack:         crack,
 		StateSendJobResult: send_job_result,
-		StateStopWorker:    stop_worker,
+		StateForceStop:       force_stop,
 		StateError:         error_state,
 		StateCleanup:       cleanup,
 	}
