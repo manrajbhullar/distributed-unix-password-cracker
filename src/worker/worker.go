@@ -69,6 +69,10 @@ type Context struct {
 	ForceStop        int32
 	CurrentState     int32
 
+	ForceStopType     string
+	ForceStopAttempts int64
+	ForceStopJobID    int
+
 	TotalAttempts int64
 	IncomingMsgs  chan map[string]any
 }
@@ -199,19 +203,13 @@ func request_job(ctx *Context) State {
 	}
 
 	if strFromAny(job["type"]) == "stop" {
+		ctx.ForceStopType = "stop"
 		return StateForceStop
 	}
 
 	if strFromAny(job["type"]) == "force_stop" {
-		fmt.Printf("\nPASSWORD FOUND\n")
-		fmt.Printf("  Stopped during no active job\n")
-		ctx.sendMu.Lock()
-		_ = sendMsg(ctx.Controller, map[string]any{
-			"type":     "force_stop_ack",
-			"attempts": 0,
-		})
-		ctx.sendMu.Unlock()
-		return StateCleanup
+		ctx.ForceStopType = "idle"
+		return StateForceStop
 	}
 
 	ack := map[string]any{
@@ -468,15 +466,10 @@ func crack(ctx *Context) State {
 	fmt.Printf("  Cracking has completed for this chunk after %d attempts\n", atomic.LoadInt64(&jobAttempts))
 
 	if atomic.LoadInt32(&ctx.ForceStop) == 1 {
-		fmt.Printf("\nPASSWORD FOUND\n")
-		fmt.Printf("  Stopped %d password attempts into Job #%d\n", atomic.LoadInt64(&jobAttempts), intFromAny(job["job_id"]))
-		ctx.sendMu.Lock()
-		_ = sendMsg(ctx.Controller, map[string]any{
-			"type":     "force_stop_ack",
-			"attempts": int(atomic.LoadInt64(&jobAttempts)),
-		})
-		ctx.sendMu.Unlock()
-		return StateCleanup
+		ctx.ForceStopType = "active"
+		ctx.ForceStopAttempts = atomic.LoadInt64(&jobAttempts)
+		ctx.ForceStopJobID = intFromAny(job["job_id"])
+		return StateForceStop
 	}
 
 	return StateSendJobResult
@@ -558,13 +551,37 @@ func send_job_result(ctx *Context) State {
 }
 
 func force_stop(ctx *Context) State {
-	fmt.Printf("\nSTOP RECEIVED (WorkerID: %s) - password found by another worker\n", ctx.WorkerID)
-	ctx.sendMu.Lock()
-	_ = sendMsg(ctx.Controller, map[string]any{
-		"type":      "disconnect",
-		"worker_id": ctx.WorkerID,
-	})
-	ctx.sendMu.Unlock()
+	switch ctx.ForceStopType {
+	case "stop":
+		fmt.Printf("\nSTOP RECEIVED (WorkerID: %s) - password found by another worker\n", ctx.WorkerID)
+		ctx.sendMu.Lock()
+		_ = sendMsg(ctx.Controller, map[string]any{
+			"type":      "disconnect",
+			"worker_id": ctx.WorkerID,
+		})
+		ctx.sendMu.Unlock()
+
+	case "idle":
+		fmt.Printf("\nPASSWORD FOUND\n")
+		fmt.Printf("  Stopped during no active job\n")
+		ctx.sendMu.Lock()
+		_ = sendMsg(ctx.Controller, map[string]any{
+			"type":     "force_stop_ack",
+			"attempts": 0,
+		})
+		ctx.sendMu.Unlock()
+
+	case "active":
+		fmt.Printf("\nPASSWORD FOUND\n")
+		fmt.Printf("  Stopped %d password attempts into Job #%d\n", ctx.ForceStopAttempts, ctx.ForceStopJobID)
+		ctx.sendMu.Lock()
+		_ = sendMsg(ctx.Controller, map[string]any{
+			"type":     "force_stop_ack",
+			"attempts": int(ctx.ForceStopAttempts),
+		})
+		ctx.sendMu.Unlock()
+	}
+
 	return StateCleanup
 }
 
@@ -594,7 +611,7 @@ func main() {
 		StateRequestJob:    request_job,
 		StateCrack:         crack,
 		StateSendJobResult: send_job_result,
-		StateForceStop:       force_stop,
+		StateForceStop:     force_stop,
 		StateError:         error_state,
 		StateCleanup:       cleanup,
 	}

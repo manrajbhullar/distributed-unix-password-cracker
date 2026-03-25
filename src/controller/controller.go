@@ -332,7 +332,7 @@ func listen(ctx *Context) State {
 			ctx.WorkerWG.Add(1)
 			go func() {
 				defer ctx.WorkerWG.Done()
-				handleWorker(ctx, conn)
+				handle_worker(ctx, conn)
 			}()
 		}
 	}()
@@ -340,7 +340,7 @@ func listen(ctx *Context) State {
 	return StateMonitorProgress
 }
 
-func handleWorker(ctx *Context, conn net.Conn) {
+func handle_worker(ctx *Context, conn net.Conn) {
 	addr := conn.RemoteAddr().String()
 	fmt.Printf("\nWORKER CONNECTED FROM: %s\n", addr)
 
@@ -405,7 +405,7 @@ func handleWorker(ctx *Context, conn net.Conn) {
 	}()
 	defer close(hbDone)
 
-	startWorkerReader(worker)
+	monitor_worker(worker)
 
 	for {
 		select {
@@ -450,15 +450,7 @@ func handleWorker(ctx *Context, conn net.Conn) {
 				send_chunk(ctx, worker, workerID)
 
 			case "heartbeat_resp":
-				select {
-				case <-hbDead:
-				default:
-					logHeartbeat(worker, msg)
-					select {
-					case worker.HBAck <- struct{}{}:
-					default:
-					}
-				}
+				receive_heartbeat(worker, msg, hbDead)
 
 			case "result":
 				worker.SendMu.Lock()
@@ -721,7 +713,7 @@ func register_worker(ctx *Context, conn net.Conn, addr string) (*WorkerInfo, err
 	return worker, nil
 }
 
-func startWorkerReader(worker *WorkerInfo) {
+func monitor_worker(worker *WorkerInfo) {
 	worker.IncomingMsgs = make(chan map[string]any, 16)
 	go func() {
 		for {
@@ -733,6 +725,18 @@ func startWorkerReader(worker *WorkerInfo) {
 			worker.IncomingMsgs <- msg
 		}
 	}()
+}
+
+func receive_heartbeat(worker *WorkerInfo, msg map[string]any, hbDead chan struct{}) {
+	select {
+	case <-hbDead:
+	default:
+		logHeartbeat(worker, msg)
+		select {
+		case worker.HBAck <- struct{}{}:
+		default:
+		}
+	}
 }
 
 func logHeartbeat(worker *WorkerInfo, msg map[string]any) {
@@ -970,7 +974,7 @@ func monitor_progress(ctx *Context) State {
 	return StateCleanup
 }
 
-func state_error(ctx *Context) State {
+func error_state(ctx *Context) State {
 	fmt.Printf("\n%s\n", ctx.ExitMessage)
 	return StateCleanup
 }
@@ -1008,7 +1012,7 @@ func main() {
 		StateParseShadow:     parse_shadow,
 		StateListen:          listen,
 		StateMonitorProgress: monitor_progress,
-		StateError:           state_error,
+		StateError:           error_state,
 		StateCleanup:         cleanup,
 	}
 
