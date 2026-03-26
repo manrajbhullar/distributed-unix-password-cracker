@@ -1,0 +1,13 @@
+Go Run
+go run controller.go -f shadow -u manraj_sha512 -p 8000 -b 10 -c 20000 -k 5000
+go run worker.go -c 192.168.0.75 -p 8000 -t 10
+
+Build
+./controller -f shadow -u manraj_sha512 -p 8000 -b 10 -c 20000 -k 5000
+./worker -c 192.168.0.75 -p 8000 -t 10
+
+Kill worker
+kill -9 $(pgrep -f "./worker")
+kill -STOP $(pgrep -f "./worker")
+
+sudo chmod 777 shadow
