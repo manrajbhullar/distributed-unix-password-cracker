@@ -10,4 +10,7 @@ Kill worker
 kill -9 $(pgrep -f "./worker")
 kill -STOP $(pgrep -f "./worker")
 
+pkill -9 -f "worker -c"
+pkill -STOP -f "worker -c"
+
 sudo chmod 777 shadow
