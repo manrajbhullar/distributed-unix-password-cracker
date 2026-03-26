@@ -143,8 +143,8 @@ func parse_arguments(ctx *Context) State {
 		return StateError
 	}
 
-	if filename == "" || username == "" || port == 0 || heartbeat == -1 || chunkSize == 0 {
-		fmt.Fprintln(os.Stderr, "Missing required flags: -f -u -p -b -c")
+	if filename == "" || username == "" || port == 0 || heartbeat == -1 || chunkSize == 0 || checkpointInterval == 0 {
+		fmt.Fprintln(os.Stderr, "Missing required flags: -f -u -p -b -c -k")
 		fs.Usage()
 		ctx.ExitMessage = "Missing required flags"
 		return StateError
@@ -175,6 +175,11 @@ func handle_arguments(ctx *Context) State {
 
 	if ctx.Settings.ChunkSize <= 0 {
 		ctx.ExitMessage = "ERROR: Chunk size must be greater than 0"
+		return StateError
+	}
+
+	if ctx.Settings.CheckpointInterval < 0 {
+		ctx.ExitMessage = "ERROR: Checkpoint interval must be 0 or greater"
 		return StateError
 	}
 
