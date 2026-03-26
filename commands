@@ -7,6 +7,9 @@ Build
 ./worker -c 192.168.0.75 -p 8000 -t 10
 
 Kill worker
+kill -9 $(pgrep -f "./worker")
+kill -STOP $(pgrep -f "./worker")
+
 pkill -9 -f "worker -c"
 pkill -STOP -f "worker -c"
 
